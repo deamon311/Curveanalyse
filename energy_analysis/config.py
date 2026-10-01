@@ -22,7 +22,7 @@ SEASON_ORDER = tuple(SEASONS)
 
 @dataclass(frozen=True)
 class AnalysisSettings:
-    """Réglages de lecture. Les valeurs par défaut correspondent au conseil PV."""
+    """Seuils de référence utilisés par le diagnostic de conseil PV."""
 
     night_start_hour: int = 23
     night_end_hour: int = 6
@@ -31,7 +31,6 @@ class AnalysisSettings:
     noise_kw: float = 0.10
     recurring_min_days: int = 10
     recurring_min_ratio: float = 0.25
-    timestamp_convention: str = "end"
 
 
 DEFAULT_SETTINGS = AnalysisSettings()

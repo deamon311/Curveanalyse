@@ -1,4 +1,4 @@
-"""Lecture et normalisation prudente des courbes de charge Excel."""
+"""Lecture et normalisation prudente des courbes Excel et CSV."""
 
 from __future__ import annotations
 
@@ -14,14 +14,39 @@ import pandas as pd
 
 from .models import DataQuality, ImportedFile
 
-IMPORT_KEYWORDS = ("soutirage", "import", "prelevement", "prelev", "achat reseau")
-EXPORT_KEYWORDS = ("surplus", "export", "injection", "reinjection", "production injectee")
+IMPORT_KEYWORDS = (
+    "soutirage",
+    "import",
+    "prelevement",
+    "prelev",
+    "achat reseau",
+    "netzstrom",
+    "netzbezug",
+    "strombezug",
+    "bezug",
+)
+EXPORT_KEYWORDS = (
+    "surplus",
+    "export",
+    "injection",
+    "reinjection",
+    "production injectee",
+    "excedent",
+    "rucklieferung",
+    "ruckspeisung",
+    "einspeisung",
+)
+DATE_KEYWORDS = ("date", "datum")
 METER_METADATA = {
     "adresse": "Adresse",
+    "addresse": "Adresse",
     "lieu de consommation": "Adresse",
+    "bezugstelle": "Adresse",
     "designation": "Objet",
     "objet": "Objet",
+    "objektbezeichnung": "Objet",
     "numero de compteur": "Compteur",
+    "zahlernummer": "Compteur",
 }
 
 
@@ -40,23 +65,51 @@ def _source_name(file_obj: str | Path | BinaryIO) -> str:
     return Path(name or str(file_obj)).name
 
 
+def _compact_label(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", normalize_text(value))
+
+
+def _is_autoconsumption_label(value: object) -> bool:
+    return "autoconsommation" in _compact_label(value)
+
+
+def _is_total_consumption_label(value: object) -> bool:
+    return "consommationtotale" in _compact_label(value)
+
+
+def _is_import_label(value: object) -> bool:
+    label = normalize_text(value)
+    compact = _compact_label(value)
+    return any(keyword in label for keyword in IMPORT_KEYWORDS) or (
+        compact.startswith("consommation")
+        and not _is_autoconsumption_label(value)
+        and not _is_total_consumption_label(value)
+    )
+
+
+def _is_export_label(value: object) -> bool:
+    label = normalize_text(value)
+    return any(keyword in label for keyword in EXPORT_KEYWORDS)
+
+
+def _is_date_label(value: object) -> bool:
+    label = normalize_text(value)
+    return any(keyword == label or keyword in label for keyword in DATE_KEYWORDS)
+
+
 def find_header_row(raw: pd.DataFrame) -> int:
-    """Trouve l'en-tête contenant la date et au moins un flux réseau."""
+    """Trouve l'en-tête FR/DE contenant la date et au moins un flux réseau."""
 
     for row_index in range(min(len(raw), 80)):
         values = [normalize_text(value) for value in raw.iloc[row_index].tolist()]
-        has_date = any(value == "date" or "date" in value for value in values)
-        has_import = any(
-            any(keyword in value for keyword in IMPORT_KEYWORDS) for value in values
-        )
-        has_export = any(
-            any(keyword in value for keyword in EXPORT_KEYWORDS) for value in values
-        )
+        has_date = any(_is_date_label(value) for value in values)
+        has_import = any(_is_import_label(value) for value in values)
+        has_export = any(_is_export_label(value) for value in values)
         if has_date and (has_import or has_export):
             return row_index
     raise ValueError(
-        "Impossible de trouver une ligne d'en-tête contenant Date et "
-        "Soutirage/Import ou Surplus/Export."
+        "Impossible de trouver une ligne d'en-tête contenant Date/Datum et "
+        "Soutirage/Import/Netzbezug ou Surplus/Export/Rücklieferung."
     )
 
 
@@ -66,11 +119,11 @@ def identify_columns(columns: pd.Index) -> tuple[object, object | None, object |
     date_col = import_col = export_col = None
     for column in columns:
         label = normalize_text(column)
-        if date_col is None and "date" in label:
+        if date_col is None and _is_date_label(label):
             date_col = column
-        if import_col is None and any(keyword in label for keyword in IMPORT_KEYWORDS):
+        if import_col is None and _is_import_label(label):
             import_col = column
-        if export_col is None and any(keyword in label for keyword in EXPORT_KEYWORDS):
+        if export_col is None and _is_export_label(label):
             export_col = column
     if date_col is None:
         raise ValueError("Colonne de date introuvable.")
@@ -88,6 +141,10 @@ def infer_column_unit(column: object | None) -> str:
         return "energy"
     if "kw" in compact:
         return "power"
+    # Les exports CSV Romande Energie nomment les colonnes « Consommation »
+    # et « Excédent » sans unité. Les valeurs sont des kWh par pas de 15 min.
+    if compact.startswith("consommation") or compact.startswith("excedent"):
+        return "energy"
     return "unknown"
 
 
@@ -137,15 +194,43 @@ def extract_metadata(raw: pd.DataFrame) -> dict[str, str]:
     return metadata
 
 
-def _read_sheet(workbook: pd.ExcelFile, sheet_name: str, source_name: str) -> ImportedFile:
-    raw = pd.read_excel(workbook, sheet_name=sheet_name, header=None, nrows=80)
-    header_row = find_header_row(raw)
-    table = pd.read_excel(workbook, sheet_name=sheet_name, header=header_row)
+def _parse_timestamps(values: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Retourne l'instant unique et l'horloge locale Europe/Zurich.
+
+    Les exports Romande Energie indiquent un offset UTC. L'instant UTC sert aux
+    doublons et aux lacunes, tandis que l'horloge locale sert aux horaires GRD.
+    Cela préserve les quatre quarts d'heure répétés au passage à l'heure d'hiver.
+    """
+
+    text = values.astype(str)
+    has_offset = text.str.contains(r"(?:Z|[+-]\d{2}:\d{2})$", regex=True, na=False).any()
+    if has_offset:
+        parsed = pd.to_datetime(values, errors="coerce", utc=True)
+        return (
+            parsed.dt.tz_localize(None),
+            parsed.dt.tz_convert("Europe/Zurich").dt.tz_localize(None),
+        )
+    parsed = pd.to_datetime(values, errors="coerce")
+    return parsed, parsed
+
+
+def _normalise_table(
+    raw: pd.DataFrame,
+    table: pd.DataFrame,
+    source_name: str,
+    sheet_name: str,
+    header_row: int,
+    *,
+    unit_override: str | None = None,
+    source_format: str = "Excel",
+) -> ImportedFile:
+    """Convertit une table fournisseur en format canonique de l'application."""
+
     table = table.dropna(how="all").copy()
     date_col, import_col, export_col = identify_columns(table.columns)
 
-    timestamp = pd.to_datetime(table[date_col], errors="coerce")
-    out = pd.DataFrame({"timestamp": timestamp})
+    timestamp, local_timestamp = _parse_timestamps(table[date_col])
+    out = pd.DataFrame({"timestamp": timestamp, "local_timestamp": local_timestamp})
     out = out.dropna(subset=["timestamp"]).copy()
     source_rows = table.index.to_series().loc[out.index].astype(int) + header_row + 2
 
@@ -159,11 +244,11 @@ def _read_sheet(workbook: pd.ExcelFile, sheet_name: str, source_name: str) -> Im
         nonlocal invalid_count
         if column is None:
             return (
-                pd.Series(0.0, index=out.index, dtype=float),
-                pd.Series(0.0, index=out.index, dtype=float),
-                pd.Series(True, index=out.index, dtype=bool),
+                pd.Series(np.nan, index=out.index, dtype=float),
+                pd.Series("missing", index=out.index, dtype="object"),
+                pd.Series(False, index=out.index, dtype=bool),
             )
-        unit = infer_column_unit(column)
+        unit = unit_override or infer_column_unit(column)
         units.append(unit)
         values = numeric_series(table.loc[out.index, column])
         valid = values.notna()
@@ -202,7 +287,31 @@ def _read_sheet(workbook: pd.ExcelFile, sheet_name: str, source_name: str) -> Im
     out["export_kwh"] = export_kwh
     out["import_valid"] = import_valid
     out["export_valid"] = export_valid
-    out["valid_measurement"] = import_valid & export_valid
+    out["import_available"] = import_col is not None
+    out["export_available"] = export_col is not None
+    # Les export CSV Romande Energie commencent à 00:00 et finissent à 23:45 :
+    # ils datent le début du pas. Les courbes Groupe E restent au format fin
+    # d'intervalle, sans jamais exposer ce choix dans l'interface.
+    out["timestamp_convention"] = "start" if source_format == "Romande Energie CSV" else "end"
+    # Un fichier peut parfaitement ne contenir qu'un seul flux. La qualité de
+    # lecture porte alors sur ce flux disponible, sans inventer l'autre.
+    out["valid_measurement"] = import_valid | export_valid
+
+    autoconsumption_col = next(
+        (column for column in table.columns if _is_autoconsumption_label(column)), None
+    )
+    total_consumption_col = next(
+        (column for column in table.columns if _is_total_consumption_label(column)), None
+    )
+    for column, prefix, key in (
+        (autoconsumption_col, "Autoconsommation", "autoconsumption"),
+        (total_consumption_col, "Consommation totale", "total_consumption"),
+    ):
+        values, value_units, valid = normalise_flux(column, prefix)
+        kwh_values, kw_values = make_energy(values, value_units)
+        out[f"{key}_kwh"] = kwh_values
+        out[f"{key}_kw"] = kw_values
+        out[f"{key}_valid"] = valid
     out["interval_h"] = interval_h
     out["source_file"] = source_name
     out["sheet_name"] = str(sheet_name)
@@ -214,6 +323,16 @@ def _read_sheet(workbook: pd.ExcelFile, sheet_name: str, source_name: str) -> Im
             "Unité absente du libellé de colonne : les valeurs ont été interprétées "
             "comme des puissances en kW."
         )
+    if import_col is None:
+        warnings.append(
+            "Le fichier ne contient pas de soutirage réseau : les analyses de consommation "
+            "réseau restent indisponibles."
+        )
+    if export_col is None:
+        warnings.append(
+            "Le fichier ne contient pas d’injection réseau : la reprise PV et le potentiel "
+            "de décalage solaire ne sont pas chiffrés."
+        )
     if invalid_count:
         warnings.append(
             f"{invalid_count} valeur(s) non numériques ou incompatibles ont été "
@@ -223,24 +342,89 @@ def _read_sheet(workbook: pd.ExcelFile, sheet_name: str, source_name: str) -> Im
         data=out.reset_index(drop=True),
         source_name=source_name,
         sheet_name=str(sheet_name),
-        metadata=extract_metadata(raw),
+        metadata={**extract_metadata(raw), "Format": source_format},
         warnings=warnings,
         nominal_interval_h=interval_h,
         invalid_numeric_values=invalid_count,
     )
 
 
-def read_energy_file(file_obj: str | Path | BinaryIO) -> ImportedFile:
-    """Lit le premier onglet Excel compatible et retourne la table canonique."""
+def _read_sheet(
+    workbook: pd.ExcelFile,
+    sheet_name: str,
+    source_name: str,
+    *,
+    unit_override: str | None = None,
+) -> ImportedFile:
+    raw = pd.read_excel(workbook, sheet_name=sheet_name, header=None, nrows=80)
+    header_row = find_header_row(raw)
+    table = pd.read_excel(workbook, sheet_name=sheet_name, header=header_row)
+    return _normalise_table(
+        raw,
+        table,
+        source_name,
+        sheet_name,
+        header_row,
+        unit_override=unit_override,
+        source_format="Excel",
+    )
+
+
+def _read_csv(
+    file_obj: str | Path | BinaryIO,
+    source_name: str,
+    *,
+    unit_override: str | None = None,
+) -> ImportedFile:
+    """Lit les exports CSV, notamment les courbes Romande Energie au pas de 15 min."""
+
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+    raw = pd.read_csv(file_obj, sep=None, engine="python", header=None, nrows=80)
+    header_row = find_header_row(raw)
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+    table = pd.read_csv(file_obj, sep=None, engine="python", header=header_row)
+    is_romande = any("consommation" in _compact_label(column) for column in table.columns)
+    return _normalise_table(
+        raw,
+        table,
+        source_name,
+        "CSV",
+        header_row,
+        unit_override=unit_override or ("energy" if is_romande else None),
+        source_format="Romande Energie CSV" if is_romande else "CSV",
+    )
+
+
+def read_energy_file(
+    file_obj: str | Path | BinaryIO,
+    *,
+    grd: str | None = None,
+) -> ImportedFile:
+    """Lit une courbe Excel ou CSV et retourne la table canonique.
+
+    Règle métier Soleol : les courbes Groupe E sont en kW et les courbes
+    Romande Energie sont en kWh par intervalle. Le GRD sélectionné dans
+    l'interface impose donc l'unité avant tout calcul.
+    """
 
     if hasattr(file_obj, "seek"):
         file_obj.seek(0)
     source_name = _source_name(file_obj)
+    unit_override = {"Groupe E": "power", "Romande Energie": "energy"}.get(grd)
+    if Path(source_name).suffix.lower() == ".csv":
+        return _read_csv(file_obj, source_name, unit_override=unit_override)
     workbook = pd.ExcelFile(file_obj, engine="openpyxl")
     errors: list[str] = []
     for sheet_name in workbook.sheet_names:
         try:
-            return _read_sheet(workbook, sheet_name, source_name)
+            return _read_sheet(
+                workbook,
+                sheet_name,
+                source_name,
+                unit_override=unit_override,
+            )
         except ValueError as exc:
             errors.append(f"{sheet_name}: {exc}")
     detail = " | ".join(errors[:3])
@@ -353,18 +537,24 @@ def combine_imports(imported_files: list[ImportedFile]) -> tuple[pd.DataFrame, D
     return combined, quality
 
 
-def apply_timestamp_convention(data: pd.DataFrame, convention: str = "end") -> pd.DataFrame:
-    """Crée l'horodatage utilisé pour les regroupements, sans modifier l'énergie."""
+def apply_timestamp_convention(data: pd.DataFrame) -> pd.DataFrame:
+    """Applique automatiquement la convention propre au format fournisseur.
+
+    Groupe E est traité comme une fin d'intervalle. Les CSV Romande Energie
+    sont traités comme un début d'intervalle, selon leur couverture 00:00–23:45.
+    L'utilisateur ne choisit jamais cette règle et l'énergie mesurée ne change pas.
+    """
 
     result = data.copy()
-    if convention not in {"end", "start"}:
-        raise ValueError("Convention d'horodatage inconnue.")
-    if convention == "end":
-        result["analysis_timestamp"] = result["timestamp"] - pd.to_timedelta(
-            result["interval_h"], unit="h"
-        )
-    else:
-        result["analysis_timestamp"] = result["timestamp"]
+    clock_timestamp = result.get("local_timestamp", result["timestamp"])
+    conventions = result.get(
+        "timestamp_convention", pd.Series("end", index=result.index, dtype="object")
+    )
+    end_interval = conventions.eq("end")
+    result["analysis_timestamp"] = clock_timestamp
+    result.loc[end_interval, "analysis_timestamp"] = clock_timestamp.loc[
+        end_interval
+    ] - pd.to_timedelta(result.loc[end_interval, "interval_h"], unit="h")
     result["year"] = result["analysis_timestamp"].dt.year
     result["month"] = result["analysis_timestamp"].dt.month
     result["month_label"] = result["analysis_timestamp"].dt.strftime("%Y-%m")

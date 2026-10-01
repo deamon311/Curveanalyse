@@ -54,6 +54,18 @@ def build_recommendations(
             )
         )
 
+    if not metrics.get("export_available", True):
+        recommendations.append(
+            _recommendation(
+                0,
+                "Donnée photovoltaïque",
+                "Compléter l’injection réseau avant de chiffrer la reprise PV",
+                "Le fichier permet d’analyser les consommations, mais ne fournit pas l’injection "
+                "réseau. Il serait trompeur d’afficher un revenu de reprise, un surplus solaire "
+                "ou un potentiel de batterie sans cette mesure.",
+            )
+        )
+
     pilotage_possible = (
         metrics["solar_export_kwh_per_day"] >= 2.0
         and metrics["outside_solar_import_kwh_per_day"] >= 2.0
@@ -186,6 +198,13 @@ def client_summary(metrics: dict[str, Any], settings: AnalysisSettings) -> str:
 
     if not metrics:
         return ""
+    if not metrics.get("export_available", True):
+        return (
+            "Cette courbe permet d’identifier les consommations et leurs horaires. Elle ne contient "
+            "pas l’injection réseau : le revenu photovoltaïque, le surplus exporté et le potentiel "
+            "de stockage ne sont donc pas chiffrés. La première étape consiste à analyser les usages "
+            "consommateurs et leurs possibilités de programmation."
+        )
     if (
         metrics["solar_export_kwh_per_day"] >= 2.0
         and metrics["outside_solar_import_kwh_per_day"] >= 2.0

@@ -35,8 +35,13 @@ def _component_rates(
     distribution_fixed: float | None = None,
     swissgrid_fixed: float | None = None,
     taxes_fixed: float | None = None,
+    energy_fixed_year: float | None = None,
+    distribution_fixed_year: float | None = None,
+    swissgrid_fixed_year: float | None = None,
+    taxes_fixed_year: float | None = None,
+    vat_purchase_pct: float | None = None,
 ) -> dict[str, float | None]:
-    """Construit une grille de tarifs en ct/kWh et CHF/mois."""
+    """Construit une grille de tarifs en ct/kWh et CHF/mois ou CHF/an."""
 
     return {
         "energy_ht_ct_kwh": energy_ht,
@@ -51,10 +56,40 @@ def _component_rates(
         "distribution_fixed_chf_month": distribution_fixed,
         "swissgrid_fixed_chf_month": swissgrid_fixed,
         "taxes_fixed_chf_month": taxes_fixed,
+        "energy_fixed_chf_year": energy_fixed_year,
+        "distribution_fixed_chf_year": distribution_fixed_year,
+        "swissgrid_fixed_chf_year": swissgrid_fixed_year,
+        "taxes_fixed_chf_year": taxes_fixed_year,
+        "vat_purchase_pct": vat_purchase_pct,
     }
 
 
 _EMPTY_COMPONENT_RATES = _component_rates()
+
+
+def _quarterly(value: float | None) -> dict[int, float | None]:
+    """Réplique une valeur dans les quatre trimestres civils."""
+
+    return {quarter: value for quarter in QUARTERS}
+
+
+_GROUP_E_PLUS_DOUBLE_2025 = _component_rates(
+    energy_ht=16.25,
+    energy_bt=11.95,
+    distribution_ht=8.27,
+    distribution_bt=3.59,
+    # La facture sépare Swissgrid (1.63) et la réserve d'hiver (0.23).
+    # Elles sont regroupées ici, mais restent identifiées dans la note.
+    swissgrid_ht=1.86,
+    swissgrid_bt=1.86,
+    taxes_ht=2.30,
+    taxes_bt=2.30,
+    energy_fixed=0.0,
+    distribution_fixed_year=120.0,
+    swissgrid_fixed=0.0,
+    taxes_fixed=0.0,
+    vat_purchase_pct=8.1,
+)
 
 
 # Sources vérifiées lors de l'intégration (01.10.2026) :
@@ -77,40 +112,110 @@ _PROFILES: dict[str, dict[str, Any]] = {
                 "label": "HT 07:00–12:00 et 17:00–23:00, tous les jours",
             },
         },
-        "offers": ("Tarif double — à ventiler selon facture",),
-        # Les fiches tarifaires détaillées Groupe E dépendent notamment du
-        # produit souscrit. Les 29.32 / 19.27 ct/kWh du fichier fourni sont un
-        # total variable non ventilé : ils ne sont volontairement pas répartis
-        # artificiellement parmi les quatre composantes de facture.
+        "offers": (
+            "PLUS tarif double interruptible — référence facture 2025",
+            "Tarif double — à compléter selon facture",
+        ),
+        # Référence explicitement issue des quatre factures fournies : Lully
+        # FR, tarif PLUS double interruptible, villa solaire 10 kVA. Elle est
+        # utile comme point de départ, mais n'est pas un barème universel
+        # Groupe E (produit, commune, puissance et taxes peuvent différer).
         "component_rates_by_year": {
-            2025: _EMPTY_COMPONENT_RATES,
+            2025: _GROUP_E_PLUS_DOUBLE_2025,
             2026: _EMPTY_COMPONENT_RATES,
         },
         "component_notes": {
-            2025: "Recopier les quatre composantes de la facture Groupe E du client.",
+            2025: (
+                "Profil de référence issu de quatre factures Groupe E 2025 : "
+                "PLUS tarif double interruptible, Lully FR, villa solaire 10 kVA. "
+                "Swissgrid 1.63 + réserve d'hiver 0.23 = 1.86 ct/kWh ; "
+                "montant de base distribution 120 CHF/an ; TVA achats 8.1 %."
+            ),
             2026: (
-                "Le fichier fourni indique 29.32 ct/kWh HT et 19.27 ct/kWh BT, "
-                "mais sans ventilation énergie / réseau / Swissgrid / taxes."
+                "Aucune facture Groupe E 2026 n'a encore été intégrée pour ce produit : "
+                "recopier les composantes de la facture du client."
             ),
         },
         "export_by_year": {
+            2017: {
+                "energy_ct_kwh": _quarterly(8.50),
+                "go_ct_kwh": _quarterly(0.80),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2018: {
+                "energy_ct_kwh": _quarterly(7.30),
+                "go_ct_kwh": _quarterly(2.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2019: {
+                "energy_ct_kwh": _quarterly(7.30),
+                "go_ct_kwh": _quarterly(2.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2020: {
+                "energy_ct_kwh": _quarterly(7.30),
+                "go_ct_kwh": _quarterly(2.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2021: {
+                "energy_ct_kwh": _quarterly(7.30),
+                "go_ct_kwh": _quarterly(2.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2022: {
+                "energy_ct_kwh": _quarterly(7.30),
+                "go_ct_kwh": _quarterly(2.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2023: {
+                "energy_ct_kwh": _quarterly(11.45),
+                "go_ct_kwh": _quarterly(3.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
+            2024: {
+                "energy_ct_kwh": _quarterly(11.45),
+                "go_ct_kwh": _quarterly(3.00),
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Historique Groupe E transmis par Soleol",
+                "note": "GO à inclure uniquement si elle a été cédée au GRD.",
+            },
             2025: {
-                "energy_ct_kwh": {1: 10.380, 2: 2.759, 3: 5.731, 4: 9.508},
+                # Le plancher de 6 ct/kWh pour les petites installations est
+                # repris ici : il est confirmé par les factures T2/T3 fournies.
+                "energy_ct_kwh": {1: 10.380, 2: 6.000, 3: 6.000, 4: 9.508},
                 "go_ct_kwh": {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0},
-                "source": "Référence OFEN + GO Groupe E (à confirmer selon contrat)",
+                "total_cap_ct_kwh": _quarterly(None),
+                "source": "Factures Groupe E 2025 + historique de reprise Soleol",
                 "note": (
-                    "Prix de marché PV OFEN. Groupe E peut appliquer une protection "
-                    "ou un plafond selon la puissance et la cession de GO."
+                    "Énergie seule confirmée sur les factures fournies : 10.38 / 6.00 / "
+                    "6.00 / 9.51 ct/kWh. Les 4 ct/kWh de GO sont distincts et ne doivent "
+                    "être inclus que si le client les a effectivement cédés au GRD."
                 ),
             },
             2026: {
-                "energy_ct_kwh": {1: 10.266, 2: 3.896, 3: None, 4: None},
+                "energy_ct_kwh": {1: 10.266, 2: 6.000, 3: None, 4: None},
                 "go_ct_kwh": {1: 3.0, 2: 1.0, 3: 1.0, 4: 3.0},
+                "total_cap_ct_kwh": {1: 10.96, 2: 10.96, 3: 10.96, 4: 10.96},
                 "source": "OFEN / offre de reprise Groupe E",
                 "note": (
-                    "Au 01.10.2026, seuls T1 et T2 sont publiés. Pour une installation "
-                    "PV < 30 kW, Groupe E indique un minimum de 6 ct/kWh lorsque le "
-                    "prix OFEN est inférieur ; vérifier le montant réellement facturé."
+                    "T1/T2 : énergie effective pour petite installation avec plancher à 6 ct/kWh. "
+                    "Si la GO est cédée, le total est plafonné à 10.96 ct/kWh pour une "
+                    "installation <100 kVA avec autoconsommation ; n'activer le plafond que "
+                    "si ces conditions sont confirmées. T3/T4 restent à renseigner."
                 ),
             },
         },
@@ -146,6 +251,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
                 distribution_fixed=9.00,
                 swissgrid_fixed=0.0,
                 taxes_fixed=0.0,
+                vat_purchase_pct=8.1,
             ),
             2026: _component_rates(
                 energy_ht=18.28,
@@ -160,6 +266,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
                 distribution_fixed=2.50,
                 swissgrid_fixed=0.0,
                 taxes_fixed=0.0,
+                vat_purchase_pct=8.1,
             ),
         },
         "component_notes": {
@@ -176,12 +283,14 @@ _PROFILES: dict[str, dict[str, Any]] = {
             2025: {
                 "energy_ct_kwh": {1: 8.0, 2: 8.0, 3: 8.0, 4: 8.0},
                 "go_ct_kwh": {1: None, 2: None, 3: None, 4: None},
+                "total_cap_ct_kwh": _quarterly(None),
                 "source": "Valeur du fichier fourni — à confirmer sur la facture 2025",
                 "note": "Le modèle trimestriel officiel est appliqué dès 2026.",
             },
             2026: {
                 "energy_ct_kwh": {1: 10.26, 2: 3.89, 3: None, 4: None},
                 "go_ct_kwh": {1: 1.5, 2: 0.5, 3: 0.5, 4: 1.5},
+                "total_cap_ct_kwh": _quarterly(None),
                 "source": "Prix de reprise Romande Energie / OFEN",
                 "note": (
                     "Au 01.10.2026, T3 et T4 restent à renseigner à leur publication. "
@@ -239,13 +348,22 @@ def component_rates_for_year(grd: str, year: int, offer: str | None = None) -> d
         raise ValueError(f"GRD inconnu : {grd}. Choisir Groupe E ou Romande Energie.")
     profile = _PROFILES[grd]
     rates_by_year = profile["component_rates_by_year"]
-    if int(year) in rates_by_year:
-        reference_year = int(year)
-    else:
-        past = [candidate for candidate in rates_by_year if candidate <= int(year)]
-        reference_year = max(past) if past else max(rates_by_year)
-    rates = deepcopy(rates_by_year[reference_year])
-    note = profile["component_notes"][reference_year]
+    requested_year = int(year)
+    reference_year: int | None = requested_year if requested_year in rates_by_year else None
+    rates = (
+        deepcopy(rates_by_year[requested_year])
+        if reference_year is not None
+        else deepcopy(_EMPTY_COMPONENT_RATES)
+    )
+    note = (
+        profile["component_notes"][requested_year]
+        if reference_year is not None
+        else "Aucun tarif de facture confirmé pour cette année : recopier la facture du client."
+    )
+    if grd == "Groupe E" and offer == "Tarif double — à compléter selon facture":
+        rates = deepcopy(_EMPTY_COMPONENT_RATES)
+        note = "Profil volontairement vide : recopier les composantes de la facture client."
+        reference_year = None
     if grd == "Romande Energie" and offer == "Double — Energie Romande":
         for key in ("energy_ht_ct_kwh", "energy_bt_ct_kwh"):
             if rates[key] is not None:
@@ -256,7 +374,7 @@ def component_rates_for_year(grd: str, year: int, offer: str | None = None) -> d
         "reference_year": reference_year,
         "rates": rates,
         "note": note,
-        "needs_confirmation": reference_year != int(year) or grd == "Groupe E",
+        "needs_confirmation": reference_year != requested_year or grd == "Groupe E",
     }
 
 
@@ -268,12 +386,19 @@ def export_rates_for_year(grd: str, year: int) -> dict[str, Any]:
     profile = _PROFILES[grd]
     by_year = profile["export_by_year"]
     if int(year) in by_year:
-        reference_year = int(year)
+        reference_year: int | None = int(year)
         needs_confirmation = False
+        result = deepcopy(by_year[reference_year])
     else:
-        reference_year = max(by_year)
+        reference_year = None
         needs_confirmation = True
-    result = deepcopy(by_year[reference_year])
+        result = {
+            "energy_ct_kwh": _quarterly(None),
+            "go_ct_kwh": _quarterly(None),
+            "total_cap_ct_kwh": _quarterly(None),
+            "source": "À compléter depuis le contrat ou la facture client",
+            "note": "Aucun tarif de reprise confirmé pour cette année.",
+        }
     result.update(
         {
             "year": int(year),

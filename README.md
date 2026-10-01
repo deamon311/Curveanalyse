@@ -7,17 +7,20 @@ batterie.
 
 ## Ce que fait l’application
 
-- charge plusieurs fichiers Excel sans modifier le code pour ajouter une année ;
-- détecte une ligne d’en-tête `Date`, `Soutirage / Import` et `Surplus / Export` ;
-- reconnaît `kW` et `kWh par intervalle` dans les libellés de colonnes ;
+- charge plusieurs fichiers Excel ou CSV sans modifier le code pour ajouter une année ;
+- détecte des en-têtes français ou allemands : `Date / Datum`,
+  `Soutirage / Import / Netzstrom` et `Surplus / Export / Rücklieferung` ;
+- applique la règle fournisseur : **Groupe E = kW**, **Romande Energie = kWh par
+  intervalle** ;
 - déduplique les mêmes horodatages sans les additionner ;
 - conserve les données au pas d’origine (quart d’heure dans les fichiers Groupe E
   testés) ;
-- calcule les kWh à partir de `kW × pas de mesure` ;
+- calcule les kWh à partir de `kW × pas de mesure` et conserve les kWh déjà
+  fournis par Romande Energie ;
 - signale les valeurs `Manquant`, les trous de mesure, les doublons et le changement
   d’heure ;
 - produit les synthèses annuelles et mensuelles, les pics et une comparaison N / N-1
-  strictement limitée aux quarts d’heure valides communs ;
+  limitée aux quarts d’heure valides communs (au moins une journée complète) ;
 - produit quatre journées types à partir des données réelles :
   printemps, été, automne et hiver ;
 - analyse l’import nocturne, l’injection entre 10 h et 16 h, le surplus disponible
@@ -43,9 +46,10 @@ La facture estimée est ventilée en quatre postes, chacun paramétrable par ann
 - Swissgrid ;
 - taxes et redevances.
 
-Les montants variables sont en `ct/kWh` HT/BT. Les frais fixes sont saisis en
-`CHF/mois` et proratisés aux jours calendaires disponibles. Les coûts sont
-calculés sur les **kWh** mesurés, jamais sur les puissances instantanées en kW.
+Les montants variables sont en `ct/kWh` HT/BT. Les frais fixes peuvent être saisis
+en `CHF/mois` ou `CHF/an` et sont proratisés aux jours calendaires disponibles.
+Les coûts sont calculés sur les **kWh** mesurés, jamais sur les puissances
+instantanées en kW.
 
 La reprise photovoltaïque est configurée séparément par **trimestre civil** :
 
@@ -57,11 +61,16 @@ Une cellule vide signifie « tarif non publié ou non confirmé » et ne vaut ja
 zéro. L’application ne calcule alors pas de solde complet, afin d’éviter toute
 fausse précision.
 
+Le préréglage Groupe E 2025 reprend les quatre factures fournies : **PLUS tarif
+double interruptible**, Lully FR, installation PV 10 kVA. Il distingue énergie,
+distribution, Swissgrid + réserve hivernale, taxe fédérale, montant de base annuel
+et TVA. C'est une référence de facture, pas un barème universel : l'offre, la
+commune et la puissance restent à valider pour chaque client. Les intitulés de
+courbes allemandes Groupe E sont reconnus ; les libellés allemands de facture sont
+repris comme aide dans les paramètres conseiller.
+
 Les préréglages Romande Energie correspondent au produit **Double — Energie
-Suisse** de la fiche tarifaire résidentielle/PME, hors TVA et hors taxes locales.
-Les montants Groupe E doivent être ventilés depuis la facture du client : le
-fichier fourni contient des prix globaux HT/BT mais pas leur ventilation entre
-les quatre postes.
+Suisse** de la fiche tarifaire résidentielle/PME, hors taxes locales.
 
 Sources à contrôler lors de chaque mise à jour annuelle :
 
@@ -71,7 +80,7 @@ Sources à contrôler lors de chaque mise à jour annuelle :
 - [prix de marché trimestriels OFEN](https://www.bfe.admin.ch/fr/prix-de-marche-de-reference).
 
 Limites explicites du module actuel : il ne choisit pas automatiquement le
-produit contractuel, la commune, les taxes locales, la TVA ou une composante de
+produit contractuel, la commune, les taxes locales ou une composante de
 puissance. Ces éléments doivent être saisis ou validés avec la facture client.
 
 L’application ne calcule **ni la consommation totale du bâtiment ni la production
@@ -90,6 +99,7 @@ analyse-energie/
 │   ├── grd_profiles.py     # horaires Groupe E / Romande Energie et reprise PV
 │   ├── tariffs.py          # coûts ventilés et reprise trimestrielle
 │   ├── recommendations.py  # règles de conseil explicables
+│   ├── report_pdf.py       # rapport client PDF Soleol
 │   ├── charts.py           # figures Plotly
 │   └── config.py           # couleurs et seuils visibles
 ├── tests/
@@ -101,15 +111,13 @@ analyse-energie/
 └── .gitignore
 ```
 
-## Convention des dates Groupe E
+## Horodatage des mesures
 
-Les deux fichiers validés commencent à `00:15` et se terminent à `00:00` le
-lendemain. La valeur est donc interprétée par défaut comme la **fin de
-l’intervalle**. Une ligne du `01.01 à 00:00` clôt ainsi le dernier quart d’heure
-du 31.12, sans créer une nouvelle année artificielle.
-
-Le choix peut être modifié dans la barre latérale si un autre fournisseur utilise
-un horodatage de début d’intervalle.
+Les courbes Groupe E sont interprétées comme des **fins d’intervalle** : une ligne
+au `01.01 à 00:00` clôt ainsi le dernier quart d’heure du 31.12. Les exports CSV
+Romande Energie observés vont de `00:00` à `23:45` et sont automatiquement traités
+comme des débuts d’intervalle. Ce choix est fixé par le format fournisseur : il n’y
+a aucune option à sélectionner dans l’interface.
 
 Les dates Excel ne contiennent pas de fuseau horaire : l’application les traite
 comme l’heure locale renseignée par le fournisseur. Elle ne reconstruit jamais
@@ -167,7 +175,8 @@ Le modèle est séparé de Streamlit pour pouvoir ajouter sans réécrire les ca
 - un scénario de pilotage paramétrable (ECS, PAC, véhicule électrique) ;
 - une simulation de batterie au quart d’heure **après** pilotage ;
 - comparaison avant / après batterie ;
-- rapport PDF client avec synthèse, graphiques, recommandations et hypothèses.
+- analyse batterie dans le rapport client (le rapport PDF avec synthèse,
+  graphiques et recommandations est déjà disponible).
 
 Le futur module batterie devra toujours afficher ses hypothèses : capacité utile,
 puissance, rendement, SOC, stratégie de charge, tarifs et règle de recharge réseau.

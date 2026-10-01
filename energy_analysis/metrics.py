@@ -11,6 +11,8 @@ import pandas as pd
 from .config import SEASON_ORDER, SEASONS, AnalysisSettings
 from .formatting import MONTH_NAMES, time_label
 
+MIN_COMPARABLE_QUARTER_HOURS = 96
+
 
 def _window_mask(minutes: pd.Series, start_hour: int, end_hour: int) -> pd.Series:
     """Fenêtre horaire [début, fin), y compris lorsqu'elle traverse minuit."""
@@ -55,9 +57,10 @@ def _coverage(first: pd.Timestamp, last: pd.Timestamp, count: int, interval_h: f
 def _peak_time(group: pd.DataFrame, column: str) -> pd.Timestamp | pd.NaT:
     if group.empty or group[column].isna().all():
         return pd.NaT
-    # Le tableau conserve l'horodatage d'origine pour pouvoir citer le relevé
-    # exactement comme il apparaît dans le fichier fournisseur.
-    return group.loc[group[column].idxmax(), "timestamp"]
+    # Les CSV Romande Energie possèdent un instant UTC canonique et une heure
+    # locale : citer l'heure locale du fournisseur au client.
+    timestamp_column = "local_timestamp" if "local_timestamp" in group.columns else "timestamp"
+    return group.loc[group[column].idxmax(), timestamp_column]
 
 
 def annual_summary(data: pd.DataFrame) -> pd.DataFrame:
@@ -135,7 +138,13 @@ def monthly_summary(data: pd.DataFrame) -> pd.DataFrame:
 def comparable_years(
     data: pd.DataFrame, current_year: int, previous_year: int
 ) -> tuple[pd.DataFrame, dict[str, object] | None]:
-    """Compare deux années seulement sur leurs pas réellement communs."""
+    """Compare deux années seulement sur une journée commune exploitable.
+
+    Une simple mesure située de part et d'autre du changement d'année ne doit
+    pas produire une comparaison N/N-1. Les courbes Soleol sont au quart
+    d'heure : 96 pas communs correspondent donc au minimum à une journée de
+    référence avant d'afficher une évolution au client.
+    """
 
     current = data[(data["year"] == current_year) & data["valid_measurement"]].copy()
     previous = data[(data["year"] == previous_year) & data["valid_measurement"]].copy()
@@ -147,7 +156,7 @@ def comparable_years(
     current_keys = pd.MultiIndex.from_frame(current[key_columns])
     previous_keys = pd.MultiIndex.from_frame(previous[key_columns])
     common_keys = current_keys.intersection(previous_keys)
-    if common_keys.empty:
+    if len(common_keys) < MIN_COMPARABLE_QUARTER_HOURS:
         return pd.DataFrame(), None
     current = current.set_index(key_columns).loc[common_keys].reset_index()
     previous = previous.set_index(key_columns).loc[common_keys].reset_index()
@@ -182,6 +191,12 @@ def profile_metrics(data: pd.DataFrame, settings: AnalysisSettings) -> dict[str,
     data = data[data["valid_measurement"]].copy()
     if data.empty:
         return {}
+    import_available = bool(
+        data.get("import_available", data["import_valid"]).fillna(False).any()
+    )
+    export_available = bool(
+        data.get("export_available", data["export_valid"]).fillna(False).any()
+    )
     night = data[data["is_night"]]
     solar = data[data["is_solar_window"]]
     outside_solar = data[data["is_outside_solar_window"]]
@@ -235,6 +250,8 @@ def profile_metrics(data: pd.DataFrame, settings: AnalysisSettings) -> dict[str,
         }
 
     return {
+        "import_available": import_available,
+        "export_available": export_available,
         "valid_days": valid_days,
         "import_total_kwh": float(data["import_kwh"].sum()),
         "export_total_kwh": float(data["export_kwh"].sum()),

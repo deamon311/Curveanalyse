@@ -7,7 +7,7 @@ et laisse volontairement ``NaN`` lorsqu'un tarif nécessaire n'est pas connu.
 
 from __future__ import annotations
 
-from calendar import monthrange
+from calendar import isleap, monthrange
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -24,11 +24,12 @@ from .grd_profiles import (
 )
 
 VARIABLE_RATE_COLUMNS = tuple(
-    f"{component}_{period}_ct_kwh"
-    for component in COMPONENTS
-    for period in ("ht", "bt")
+    f"{component}_{period}_ct_kwh" for component in COMPONENTS for period in ("ht", "bt")
 )
 FIXED_RATE_COLUMNS = tuple(f"{component}_fixed_chf_month" for component in COMPONENTS)
+FIXED_ANNUAL_RATE_COLUMNS = tuple(f"{component}_fixed_chf_year" for component in COMPONENTS)
+VAT_RATE_COLUMNS = ("vat_purchase_pct",)
+FIXED_TABLE_RATE_COLUMNS = FIXED_RATE_COLUMNS + FIXED_ANNUAL_RATE_COLUMNS + VAT_RATE_COLUMNS
 
 
 def _optional_float(value: object) -> float | None:
@@ -100,12 +101,15 @@ def default_rate_tables(
     notes: list[str] = []
     for year in sorted({int(value) for value in years}):
         component = component_rates_for_year(grd, year, offer)
-        variable_rows.append({"Année": year, **{
-            key: component["rates"][key] for key in VARIABLE_RATE_COLUMNS
-        }})
-        fixed_rows.append({"Année": year, **{
-            key: component["rates"][key] for key in FIXED_RATE_COLUMNS
-        }})
+        variable_rows.append(
+            {"Année": year, **{key: component["rates"][key] for key in VARIABLE_RATE_COLUMNS}}
+        )
+        fixed_rows.append(
+            {
+                "Année": year,
+                **{key: component["rates"][key] for key in FIXED_TABLE_RATE_COLUMNS},
+            }
+        )
         notes.append(f"{year} : {component['note']}")
 
         export = export_rates_for_year(grd, year)
@@ -116,6 +120,7 @@ def default_rate_tables(
                     "Trimestre": quarter,
                     "energy_ct_kwh": export["energy_ct_kwh"].get(quarter),
                     "go_ct_kwh": export["go_ct_kwh"].get(quarter),
+                    "total_cap_ct_kwh": export["total_cap_ct_kwh"].get(quarter),
                     "Source": export["source"],
                     "Note": export["note"],
                 }
@@ -144,11 +149,15 @@ def rates_from_tables(
     for _, row in variable_rates.iterrows():
         year = int(row["Année"])
         rates.setdefault(year, {})
-        rates[year].update({key: _optional_float(row.get(key)) for key in VARIABLE_RATE_COLUMNS})
+        rates[year].update(
+            {key: _optional_float(row.get(key)) for key in VARIABLE_RATE_COLUMNS}
+        )
     for _, row in fixed_rates.iterrows():
         year = int(row["Année"])
         rates.setdefault(year, {})
-        rates[year].update({key: _optional_float(row.get(key)) for key in FIXED_RATE_COLUMNS})
+        rates[year].update(
+            {key: _optional_float(row.get(key)) for key in FIXED_TABLE_RATE_COLUMNS}
+        )
     for _, row in export_rates.iterrows():
         year = int(row["Année"])
         quarter = int(row["Trimestre"])
@@ -158,6 +167,9 @@ def rates_from_tables(
         )
         rates[year].setdefault("export_go_ct_by_quarter", {})[quarter] = _optional_float(
             row.get("go_ct_kwh")
+        )
+        rates[year].setdefault("export_total_cap_ct_by_quarter", {})[quarter] = _optional_float(
+            row.get("total_cap_ct_kwh")
         )
     return rates
 
@@ -200,6 +212,7 @@ def apply_billing_rates(
     rates_by_year: Mapping[int, Mapping[str, Any]],
     *,
     include_go: bool = False,
+    apply_export_total_cap: bool = False,
 ) -> pd.DataFrame:
     """Applique les composantes de facture aux énergies mesurées.
 
@@ -209,6 +222,11 @@ def apply_billing_rates(
     """
 
     result = classify_tariff(data, grd)
+    result["vat_purchase_pct"] = pd.Series(
+        [_rate_at(rates_by_year, int(year), "vat_purchase_pct") for year in result["year"]],
+        index=result.index,
+        dtype="float64",
+    )
     import_valid = _import_valid(result)
     export_valid = _export_valid(result)
     import_zero = import_valid & result["import_kwh"].eq(0)
@@ -234,7 +252,9 @@ def apply_billing_rates(
         component_cost_columns.append(cost_column)
         complete_component_rates.append(result[rate_column].notna())
 
-    component_rates_complete = pd.concat(complete_component_rates, axis=1).all(axis=1) | import_zero
+    component_rates_complete = (
+        pd.concat(complete_component_rates, axis=1).all(axis=1) | import_zero
+    )
     result["import_rate_complete"] = component_rates_complete
     result["import_variable_cost_chf"] = result[component_cost_columns].sum(
         axis=1, min_count=len(component_cost_columns)
@@ -251,6 +271,9 @@ def apply_billing_rates(
     )
     result["export_go_rate_ct_kwh"] = _export_rate_series(
         result, rates_by_year, "export_go_ct_by_quarter"
+    )
+    result["export_total_cap_rate_ct_kwh"] = _export_rate_series(
+        result, rates_by_year, "export_total_cap_ct_by_quarter"
     )
     result["export_energy_revenue_chf"] = np.where(
         export_zero,
@@ -273,11 +296,36 @@ def apply_billing_rates(
     expected_export_rates = result["export_energy_rate_ct_kwh"].notna() | export_zero
     if include_go:
         expected_export_rates &= result["export_go_rate_ct_kwh"].notna() | export_zero
-        result["export_revenue_chf"] = result[
-            ["export_energy_revenue_chf", "export_go_revenue_chf"]
-        ].sum(axis=1, min_count=2)
+        raw_export_revenue = result[["export_energy_revenue_chf", "export_go_revenue_chf"]].sum(
+            axis=1, min_count=2
+        )
+        raw_rate = result["export_energy_rate_ct_kwh"] + result["export_go_rate_ct_kwh"]
+        if apply_export_total_cap:
+            effective_rate = raw_rate.where(
+                result["export_total_cap_rate_ct_kwh"].isna(),
+                raw_rate.clip(upper=result["export_total_cap_rate_ct_kwh"]),
+            )
+        else:
+            effective_rate = raw_rate
+        result["export_effective_rate_ct_kwh"] = effective_rate.where(~export_zero, 0.0)
+        result["export_revenue_chf"] = np.where(
+            export_zero,
+            0.0,
+            np.where(
+                export_valid & expected_export_rates,
+                result["export_kwh"] * result["export_effective_rate_ct_kwh"] / 100,
+                np.nan,
+            ),
+        )
+        result["export_cap_adjustment_chf"] = result["export_revenue_chf"] - raw_export_revenue
     else:
+        # La GO reste visible comme tarif potentiel dans l'éditeur, mais ne
+        # doit pas apparaître comme recette dans les résultats lorsqu'elle
+        # n'a pas été cédée au GRD.
+        result["export_go_revenue_chf"] = np.nan
         result["export_revenue_chf"] = result["export_energy_revenue_chf"]
+        result["export_effective_rate_ct_kwh"] = result["export_energy_rate_ct_kwh"]
+        result["export_cap_adjustment_chf"] = 0.0
     result["export_rate_complete"] = expected_export_rates
     result["export_priced_kwh"] = np.where(
         export_valid & expected_export_rates, result["export_kwh"], 0.0
@@ -285,9 +333,9 @@ def apply_billing_rates(
     result["export_unpriced_kwh"] = np.where(
         export_valid & ~expected_export_rates, result["export_kwh"], 0.0
     )
-    result["net_variable_cost_chf"] = result["import_variable_cost_chf"] - result[
-        "export_revenue_chf"
-    ]
+    result["net_variable_cost_chf"] = (
+        result["import_variable_cost_chf"] - result["export_revenue_chf"]
+    )
     return result
 
 
@@ -318,18 +366,38 @@ def fixed_charges_by_month(
         }
         cost_columns = []
         known_rates = []
+        fixed_rate_conflict = False
         for component in COMPONENTS:
             rate_key = f"{component}_fixed_chf_month"
+            annual_rate_key = f"{component}_fixed_chf_year"
             cost_key = f"{component}_fixed_cost_chf"
-            rate = _rate_at(rates_by_year, int(year), rate_key)
-            row[rate_key] = rate
-            row[cost_key] = np.nan if rate is None else rate * prorata
+            monthly_rate = _rate_at(rates_by_year, int(year), rate_key)
+            annual_rate = _rate_at(rates_by_year, int(year), annual_rate_key)
+            row[rate_key] = monthly_rate
+            row[annual_rate_key] = annual_rate
+            if monthly_rate is not None and annual_rate is not None:
+                # Une même composante ne doit jamais être facturée deux fois.
+                # Le conseiller doit choisir le montant mensuel ou annuel.
+                row[cost_key] = np.nan
+                fixed_rate_conflict = True
+                known_rates.append(False)
+            elif monthly_rate is not None:
+                row[cost_key] = monthly_rate * prorata
+                known_rates.append(True)
+            elif annual_rate is not None:
+                year_days = 366 if isleap(int(year)) else 365
+                row[cost_key] = annual_rate * days_present / year_days
+                known_rates.append(True)
+            else:
+                row[cost_key] = np.nan
+                known_rates.append(False)
             cost_columns.append(cost_key)
-            known_rates.append(rate is not None)
-        row["fixed_cost_complete"] = all(known_rates)
-        row["fixed_cost_chf"] = pd.DataFrame([row])[cost_columns].sum(
-            axis=1, min_count=len(cost_columns)
-        ).iloc[0]
+        row["vat_purchase_pct"] = _rate_at(rates_by_year, int(year), "vat_purchase_pct")
+        row["fixed_rate_conflict"] = fixed_rate_conflict
+        row["fixed_cost_complete"] = all(known_rates) and not fixed_rate_conflict
+        row["fixed_cost_chf"] = (
+            pd.DataFrame([row])[cost_columns].sum(axis=1, min_count=len(cost_columns)).iloc[0]
+        )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -360,6 +428,8 @@ def billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.DataFrame:
             "import_missing_intervals": int(group["import_measurement_missing"].sum()),
             "export_missing_intervals": int(group["export_measurement_missing"].sum()),
         }
+        vat_rates = group["vat_purchase_pct"].dropna().unique()
+        row["vat_purchase_pct"] = float(vat_rates[0]) if len(vat_rates) == 1 else np.nan
         for component in COMPONENTS:
             row[f"{component}_cost_chf"] = _sum_or_nan(group[f"{component}_cost_chf"])
         row["import_variable_cost_chf"] = _sum_or_nan(group["import_variable_cost_chf"])
@@ -371,18 +441,21 @@ def billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.DataFrame:
     if fixed.empty:
         summary["fixed_cost_chf"] = np.nan
         summary["fixed_complete"] = False
+        summary["fixed_rate_conflict"] = False
     else:
         fixed_summary = (
             fixed.groupby("year", as_index=False)
             .agg(
                 fixed_cost_chf=("fixed_cost_chf", _sum_or_nan),
                 fixed_complete=("fixed_cost_complete", "all"),
+                fixed_rate_conflict=("fixed_rate_conflict", "any"),
                 fixed_prorata=("prorata", "sum"),
             )
             .astype({"year": int})
         )
         summary = summary.merge(fixed_summary, on="year", how="left")
         summary["fixed_complete"] = summary["fixed_complete"].fillna(False)
+        summary["fixed_rate_conflict"] = summary["fixed_rate_conflict"].fillna(False)
     summary["is_complete"] = (
         (summary["import_unpriced_kwh"].fillna(0) <= 1e-9)
         & (summary["export_unpriced_kwh"].fillna(0) <= 1e-9)
@@ -395,6 +468,19 @@ def billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.DataFrame:
         summary["import_variable_cost_chf"]
         - summary["export_revenue_chf"]
         + summary["fixed_cost_chf"],
+        np.nan,
+    )
+    summary["taxable_purchase_cost_chf"] = (
+        summary["import_variable_cost_chf"] + summary["fixed_cost_chf"]
+    )
+    summary["vat_cost_chf"] = np.where(
+        summary["vat_purchase_pct"].notna(),
+        summary["taxable_purchase_cost_chf"] * summary["vat_purchase_pct"] / 100,
+        np.nan,
+    )
+    summary["net_estimated_cost_ttc_chf"] = np.where(
+        summary["is_complete"] & summary["vat_cost_chf"].notna(),
+        summary["net_estimated_cost_chf"] + summary["vat_cost_chf"],
         np.nan,
     )
     return summary
@@ -411,8 +497,12 @@ def monthly_billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.Dat
             "year": int(year),
             "month": int(month),
             "label": f"{MONTH_NAMES[int(month)][:3]} {int(year)}",
-            "import_ht_kwh": _sum_or_nan(group.loc[group["tariff_period"] == "HT", "import_kwh"]),
-            "import_bt_kwh": _sum_or_nan(group.loc[group["tariff_period"] == "BT", "import_kwh"]),
+            "import_ht_kwh": _sum_or_nan(
+                group.loc[group["tariff_period"] == "HT", "import_kwh"]
+            ),
+            "import_bt_kwh": _sum_or_nan(
+                group.loc[group["tariff_period"] == "BT", "import_kwh"]
+            ),
             "import_priced_kwh": _sum_or_nan(group["import_priced_kwh"]),
             "import_unpriced_kwh": _sum_or_nan(group["import_unpriced_kwh"]),
             "export_priced_kwh": _sum_or_nan(group["export_priced_kwh"]),
@@ -422,6 +512,8 @@ def monthly_billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.Dat
             "import_variable_cost_chf": _sum_or_nan(group["import_variable_cost_chf"]),
             "export_revenue_chf": _sum_or_nan(group["export_revenue_chf"]),
         }
+        vat_rates = group["vat_purchase_pct"].dropna().unique()
+        row["vat_purchase_pct"] = float(vat_rates[0]) if len(vat_rates) == 1 else np.nan
         for component in COMPONENTS:
             row[f"{component}_cost_chf"] = _sum_or_nan(group[f"{component}_cost_chf"])
         rows.append(row)
@@ -429,10 +521,20 @@ def monthly_billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.Dat
     if fixed.empty:
         summary["fixed_cost_chf"] = np.nan
         summary["fixed_complete"] = False
+        summary["fixed_rate_conflict"] = False
     else:
-        values = fixed[["year", "month", "fixed_cost_chf", "fixed_cost_complete"]]
+        values = fixed[
+            [
+                "year",
+                "month",
+                "fixed_cost_chf",
+                "fixed_cost_complete",
+                "fixed_rate_conflict",
+            ]
+        ]
         summary = summary.merge(values, on=["year", "month"], how="left")
         summary["fixed_complete"] = summary["fixed_cost_complete"].fillna(False)
+        summary["fixed_rate_conflict"] = summary["fixed_rate_conflict"].fillna(False)
         summary = summary.drop(columns="fixed_cost_complete")
     summary["is_complete"] = (
         (summary["import_unpriced_kwh"].fillna(0) <= 1e-9)
@@ -448,6 +550,19 @@ def monthly_billing_summary(priced: pd.DataFrame, fixed: pd.DataFrame) -> pd.Dat
         + summary["fixed_cost_chf"],
         np.nan,
     )
+    summary["taxable_purchase_cost_chf"] = (
+        summary["import_variable_cost_chf"] + summary["fixed_cost_chf"]
+    )
+    summary["vat_cost_chf"] = np.where(
+        summary["vat_purchase_pct"].notna(),
+        summary["taxable_purchase_cost_chf"] * summary["vat_purchase_pct"] / 100,
+        np.nan,
+    )
+    summary["net_estimated_cost_ttc_chf"] = np.where(
+        summary["is_complete"] & summary["vat_cost_chf"].notna(),
+        summary["net_estimated_cost_chf"] + summary["vat_cost_chf"],
+        np.nan,
+    )
     return summary
 
 
@@ -460,6 +575,8 @@ def quarterly_export_summary(priced: pd.DataFrame) -> pd.DataFrame:
     for (year, quarter), group in priced.groupby(["year", "quarter"], sort=True):
         energy_rates = group["export_energy_rate_ct_kwh"].dropna().unique()
         go_rates = group["export_go_rate_ct_kwh"].dropna().unique()
+        effective_rates = group["export_effective_rate_ct_kwh"].dropna().unique()
+        cap_rates = group["export_total_cap_rate_ct_kwh"].dropna().unique()
         rows.append(
             {
                 "year": int(year),
@@ -468,10 +585,17 @@ def quarterly_export_summary(priced: pd.DataFrame) -> pd.DataFrame:
                 "export_kwh": _sum_or_nan(group["export_kwh"]),
                 "export_priced_kwh": _sum_or_nan(group["export_priced_kwh"]),
                 "export_unpriced_kwh": _sum_or_nan(group["export_unpriced_kwh"]),
-                "energy_rate_ct_kwh": float(energy_rates[0]) if len(energy_rates) == 1 else np.nan,
+                "energy_rate_ct_kwh": float(energy_rates[0])
+                if len(energy_rates) == 1
+                else np.nan,
                 "go_rate_ct_kwh": float(go_rates[0]) if len(go_rates) == 1 else np.nan,
+                "effective_rate_ct_kwh": (
+                    float(effective_rates[0]) if len(effective_rates) == 1 else np.nan
+                ),
+                "total_cap_ct_kwh": float(cap_rates[0]) if len(cap_rates) == 1 else np.nan,
                 "energy_revenue_chf": _sum_or_nan(group["export_energy_revenue_chf"]),
                 "go_revenue_chf": _sum_or_nan(group["export_go_revenue_chf"]),
+                "cap_adjustment_chf": _sum_or_nan(group["export_cap_adjustment_chf"]),
                 "export_revenue_chf": _sum_or_nan(group["export_revenue_chf"]),
             }
         )

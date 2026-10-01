@@ -23,7 +23,7 @@ from energy_analysis.charts import (
     typical_day_chart,
 )
 from energy_analysis.config import BRAND_ORANGE, SEASON_ORDER, AnalysisSettings
-from energy_analysis.formatting import chf, hours, kw, kwh, pct, swiss_number
+from energy_analysis.formatting import chf, kw, kwh, pct, swiss_number
 from energy_analysis.grd_profiles import GRD_NAMES, offers_for_grd, profile_for_year
 from energy_analysis.ingest import (
     apply_timestamp_convention,
@@ -40,6 +40,7 @@ from energy_analysis.metrics import (
 )
 from energy_analysis.models import ImportedFile
 from energy_analysis.recommendations import build_recommendations, client_summary
+from energy_analysis.report_pdf import generate_energy_report
 from energy_analysis.tariffs import (
     apply_billing_rates,
     billing_summary,
@@ -164,17 +165,40 @@ def inject_style() -> None:
 
 
 @st.cache_data(show_spinner=False)
-def parse_uploaded_file(file_name: str, contents: bytes) -> ImportedFile:
+def parse_uploaded_file(file_name: str, contents: bytes, grd: str) -> ImportedFile:
     """Cache la lecture d'un fichier inchangé pendant les interactions UI."""
 
     buffer = io.BytesIO(contents)
     buffer.name = file_name
-    return read_energy_file(buffer)
+    return read_energy_file(buffer, grd=grd)
 
 
-def energy_sum(data: pd.DataFrame, column: str) -> float:
+def energy_sum(data: pd.DataFrame, column: str) -> float | None:
     value = data[column].sum(min_count=1)
-    return float(value) if pd.notna(value) else 0.0
+    return float(value) if pd.notna(value) else None
+
+
+def flux_available(data: pd.DataFrame, flux: str) -> bool:
+    """Indique si le fournisseur a réellement livré le flux demandé."""
+
+    availability = data.get(f"{flux}_available")
+    if availability is not None:
+        return bool(availability.fillna(False).any())
+    validity = data.get(f"{flux}_valid")
+    return bool(validity.fillna(False).any()) if validity is not None else False
+
+
+def peak_value_and_time(
+    data: pd.DataFrame, column: str
+) -> tuple[float | None, pd.Timestamp | None]:
+    """Retourne un pic seulement lorsque le flux est disponible."""
+
+    values = data[column].dropna()
+    if values.empty:
+        return None, None
+    index = values.idxmax()
+    timestamp_column = "local_timestamp" if "local_timestamp" in data.columns else "timestamp"
+    return float(values.loc[index]), pd.Timestamp(data.loc[index, timestamp_column])
 
 
 def metric_with_caption(label: str, value: str, caption: str = "") -> None:
@@ -234,6 +258,11 @@ FIXED_RATE_LABELS = {
     "distribution_fixed_chf_month": "Distribution & mesure [CHF/mois]",
     "swissgrid_fixed_chf_month": "Swissgrid [CHF/mois]",
     "taxes_fixed_chf_month": "Taxes [CHF/mois]",
+    "energy_fixed_chf_year": "Énergie [CHF/an]",
+    "distribution_fixed_chf_year": "Distribution & mesure [CHF/an]",
+    "swissgrid_fixed_chf_year": "Swissgrid [CHF/an]",
+    "taxes_fixed_chf_year": "Taxes [CHF/an]",
+    "vat_purchase_pct": "TVA sur achats [%]",
 }
 
 
@@ -244,14 +273,9 @@ def tariff_table_key(grd: str, offer: str, years: list[int], table: str) -> str:
 
 def show_tariff_configuration(
     grd: str, offer: str, years: list[int]
-) -> tuple[dict[int, dict[str, object]], bool, pd.DataFrame]:
-    """Affiche et lit les montants servant à l'estimation tarifaire."""
+) -> tuple[dict[int, dict[str, object]], bool, bool, pd.DataFrame]:
+    """Affiche un résumé client, puis les réglages réservés au conseiller."""
 
-    st.subheader("Tarif GRD et paramètres de facture")
-    st.caption(
-        "Cette première version cible le tarif double basse tension. Les montants sont "
-        "appliqués aux kWh mesurés ; ils restent modifiables et ne remplacent pas une facture."
-    )
     schedules = []
     for year in years:
         schedule = profile_for_year(grd, year)
@@ -266,29 +290,28 @@ def show_tariff_configuration(
                 ),
             }
         )
-    st.dataframe(pd.DataFrame(schedules), width="stretch", hide_index=True)
-    if any(profile_for_year(grd, year)["schedule_needs_confirmation"] for year in years):
-        st.warning(
-            "Au moins une année ne dispose pas encore d’un calendrier officiel dans l’application. "
-            "Le dernier calendrier connu est proposé uniquement comme repère."
-        )
-
     variable_defaults, fixed_defaults, export_defaults, notes = default_rate_tables(
         grd, years, offer
     )
+
+    st.subheader("Tarif appliqué")
+    left, right = st.columns(2)
+    with left:
+        st.metric("Gestionnaire de réseau", grd)
+        st.caption(offer)
+    with right:
+        labels = " · ".join(item["Horaires appliqués"] for item in schedules)
+        st.metric("Horaires HT / BT", "Tarif double")
+        st.caption(labels)
     if grd == "Groupe E":
-        st.info(
-            "Les horaires Groupe E sont intégrés. Les prix du fichier fourni sont globaux et "
-            "non ventilés : renseignez les quatre composantes de la facture client avant de "
-            "lire une estimation de coût complète."
+        st.caption(
+            "Référence 2025 : quatre factures Groupe E, produit PLUS tarif double interruptible. "
+            "Les montants restent vérifiables par facture client."
         )
     else:
-        st.info(
-            "Les préremplissages Romande Energie correspondent au tarif Double, offre "
-            "Energie Suisse/Romande, hors TVA et hors taxes cantonales ou communales."
+        st.caption(
+            "Préréglage résidentiel/PME : tarif Double, à contrôler avec la commune et le produit du client."
         )
-    for note in notes:
-        st.caption(note)
 
     variable_config = {
         "Année": st.column_config.NumberColumn("Année", format="%d"),
@@ -311,55 +334,91 @@ def show_tariff_configuration(
             "Reprise énergie [ct/kWh]", min_value=0.0, step=0.001
         ),
         "go_ct_kwh": st.column_config.NumberColumn("GO [ct/kWh]", min_value=0.0, step=0.001),
+        "total_cap_ct_kwh": st.column_config.NumberColumn(
+            "Plafond total [ct/kWh]", min_value=0.0, step=0.001
+        ),
         "Source": st.column_config.TextColumn("Source", width="medium"),
         "Note": st.column_config.TextColumn("Note", width="large"),
     }
 
-    st.markdown("#### Montants variables hors TVA")
-    variable_rates = st.data_editor(
-        variable_defaults,
-        column_config=variable_config,
-        disabled=["Année"],
-        hide_index=True,
-        num_rows="fixed",
-        width="stretch",
-        key=tariff_table_key(grd, offer, years, "variable"),
+    with st.expander("Paramètres tarifaires du conseiller", expanded=False):
+        st.caption(
+            "Les tableaux suivants servent à vérifier ou adapter la facture. Ils ne sont pas "
+            "nécessaires à la lecture du résultat avec le client."
+        )
+        st.caption(
+            "Repères facture allemande : Energie = énergie ; Netznutzung/Verteilung = distribution ; "
+            "Abgaben/Steuern = taxes ; Grundpreis = frais fixes ; "
+            "Rücklieferung/Einspeisung = reprise PV ; MwSt. = TVA."
+        )
+        st.dataframe(pd.DataFrame(schedules), width="stretch", hide_index=True)
+        if any(profile_for_year(grd, year)["schedule_needs_confirmation"] for year in years):
+            st.warning(
+                "Au moins une année ne dispose pas d’un calendrier officiel intégré. "
+                "Le dernier calendrier connu est proposé uniquement comme repère."
+            )
+        for note in notes:
+            st.caption(note)
+
+        st.markdown("#### Montants variables hors TVA")
+        variable_rates = st.data_editor(
+            variable_defaults,
+            column_config=variable_config,
+            disabled=["Année"],
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            key=tariff_table_key(grd, offer, years, "variable"),
+        )
+        st.markdown("#### Frais fixes et TVA")
+        st.caption(
+            "Renseignez un montant mensuel ou annuel par composante, sans dupliquer les deux. "
+            "Les montants sont proratisés selon les jours calendaires présents dans la période."
+        )
+        fixed_rates = st.data_editor(
+            fixed_defaults,
+            column_config=fixed_config,
+            disabled=["Année"],
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            key=tariff_table_key(grd, offer, years, "fixed"),
+        )
+        st.markdown("#### Reprise photovoltaïque par trimestre")
+        include_go = st.checkbox(
+            "Inclure la rémunération des garanties d’origine (GO)",
+            value=False,
+            help="À activer uniquement si le client a effectivement cédé ses garanties d’origine au GRD.",
+            key=tariff_table_key(grd, offer, years, "go"),
+        )
+        apply_export_total_cap = st.checkbox(
+            "Appliquer le plafond total de reprise si les conditions du client sont confirmées",
+            value=False,
+            disabled=not include_go,
+            help=(
+                "Pour Groupe E 2026, à utiliser uniquement lorsque l'installation est <100 kVA, "
+                "avec autoconsommation et cession effective des GO."
+            ),
+            key=tariff_table_key(grd, offer, years, "export_cap"),
+        )
+        st.caption(
+            "Les cellules vides signifient « tarif non publié ou non confirmé », jamais 0 ct/kWh."
+        )
+        export_rates = st.data_editor(
+            export_defaults,
+            column_config=export_config,
+            disabled=["Année", "Trimestre", "Source", "Note"],
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            key=tariff_table_key(grd, offer, years, "export"),
+        )
+    return (
+        rates_from_tables(variable_rates, fixed_rates, export_rates),
+        include_go,
+        apply_export_total_cap,
+        export_rates,
     )
-    st.markdown("#### Frais fixes hors TVA")
-    st.caption(
-        "Les frais fixes sont indiqués en CHF/mois et proratisés selon les jours calendaires "
-        "présents dans la période analysée. Mettre 0 lorsqu’aucun frais ne s’applique."
-    )
-    fixed_rates = st.data_editor(
-        fixed_defaults,
-        column_config=fixed_config,
-        disabled=["Année"],
-        hide_index=True,
-        num_rows="fixed",
-        width="stretch",
-        key=tariff_table_key(grd, offer, years, "fixed"),
-    )
-    st.markdown("#### Reprise photovoltaïque par trimestre")
-    include_go = st.checkbox(
-        "Inclure la rémunération des garanties d’origine (GO)",
-        value=False,
-        help="À activer uniquement si le client a effectivement cédé ses garanties d’origine au GRD.",
-        key=tariff_table_key(grd, offer, years, "go"),
-    )
-    st.caption(
-        "Les cellules vides signifient « tarif non publié ou non confirmé », jamais 0 ct/kWh. "
-        "Les valeurs de reprise doivent être vérifiées sur la facture ou le contrat client."
-    )
-    export_rates = st.data_editor(
-        export_defaults,
-        column_config=export_config,
-        disabled=["Année", "Trimestre", "Source", "Note"],
-        hide_index=True,
-        num_rows="fixed",
-        width="stretch",
-        key=tariff_table_key(grd, offer, years, "export"),
-    )
-    return rates_from_tables(variable_rates, fixed_rates, export_rates), include_go, export_rates
 
 
 def show_empty_state() -> None:
@@ -375,7 +434,7 @@ def show_empty_state() -> None:
         unsafe_allow_html=True,
     )
     st.info(
-        "Ajoutez une ou plusieurs courbes Excel dans le panneau de gauche. "
+        "Ajoutez une ou plusieurs courbes de mesure ci-dessus. "
         "Les fichiers restent utilisés uniquement pour la session d’analyse."
     )
     left, middle, right = st.columns(3)
@@ -403,16 +462,19 @@ def show_summary_tab(
 ) -> None:
     total_import = energy_sum(data, "import_kwh")
     total_export = energy_sum(data, "export_kwh")
-    peak_import = float(data["import_kw"].max())
-    peak_export = float(data["export_kw"].max())
+    peak_import, peak_import_time = peak_value_and_time(data, "import_kw")
+    peak_export, peak_export_time = peak_value_and_time(data, "export_kw")
     valid_coverage = float(data["valid_measurement"].mean())
-    peak_import_time = data.loc[data["import_kw"].idxmax(), "timestamp"]
-    peak_export_time = data.loc[data["export_kw"].idxmax(), "timestamp"]
+    balance = (
+        total_import - total_export
+        if total_import is not None and total_export is not None
+        else None
+    )
 
     st.subheader("Synthèse énergétique")
     st.caption(
-        "Le solde import − injection est un indicateur de flux réseau. "
-        "Il ne représente ni la consommation totale du bâtiment ni la production PV totale."
+        "Les flux réseau ne représentent ni la consommation totale du bâtiment ni la production "
+        "photovoltaïque totale. Une valeur absente signifie que le fournisseur ne l’a pas livrée."
     )
     columns = st.columns(6)
     with columns[0]:
@@ -420,18 +482,34 @@ def show_summary_tab(
     with columns[1]:
         metric_with_caption("Export / injection", kwh(total_export))
     with columns[2]:
-        metric_with_caption("Solde réseau", kwh(total_import - total_export))
+        metric_with_caption("Solde réseau", kwh(balance))
     with columns[3]:
         metric_with_caption(
-            "Pic soutirage", kw(peak_import), f"Source : {peak_import_time:%d.%m.%Y %H:%M}"
+            "Pic soutirage",
+            kw(peak_import),
+            f"Source : {peak_import_time:%d.%m.%Y %H:%M}"
+            if peak_import_time is not None
+            else "Donnée indisponible",
         )
     with columns[4]:
         metric_with_caption(
-            "Pic injection", kw(peak_export), f"Source : {peak_export_time:%d.%m.%Y %H:%M}"
+            "Pic injection",
+            kw(peak_export),
+            f"Source : {peak_export_time:%d.%m.%Y %H:%M}"
+            if peak_export_time is not None
+            else "Donnée non fournie",
         )
     with columns[5]:
         metric_with_caption(
-            "Mesures exploitables", pct(valid_coverage * 100), "Import et injection connus"
+            "Mesures exploitables",
+            pct(valid_coverage * 100),
+            "Au moins un flux réseau disponible",
+        )
+
+    if not flux_available(data, "export"):
+        st.info(
+            "Ce fichier ne fournit pas l’injection réseau. L’analyse de consommation reste "
+            "disponible, mais la reprise PV et le potentiel de décalage solaire ne sont pas chiffrés."
         )
 
     st.plotly_chart(annual_energy_chart(annual), width="stretch")
@@ -571,13 +649,14 @@ def show_tariff_results(
     quarterly_billing: pd.DataFrame,
     grd: str,
     include_go: bool,
+    apply_export_total_cap: bool,
 ) -> None:
     """Affiche la lecture client de l'estimation tarifaire paramétrée."""
 
     st.divider()
     st.subheader("Estimation de facture sur les flux réseau mesurés")
     st.caption(
-        "Montants hors TVA, hors éventuelle composante puissance et hors postes non renseignés. "
+        "Montants hors éventuelle composante puissance et hors postes non renseignés. "
         "La reprise PV est une recette distincte ; elle ne comprend ni réseau ni taxes."
     )
     if annual_billing.empty:
@@ -591,10 +670,14 @@ def show_tariff_results(
     import_cost = tariff_sum(annual_billing, "import_variable_cost_chf")
     export_revenue = tariff_sum(annual_billing, "export_revenue_chf")
     fixed_cost = tariff_sum(annual_billing, "fixed_cost_chf")
+    vat_cost = tariff_sum(annual_billing, "vat_cost_chf")
     net_cost = tariff_sum(annual_billing, "net_estimated_cost_chf")
+    net_cost_ttc = tariff_sum(annual_billing, "net_estimated_cost_ttc_chf")
     complete = bool(annual_billing["is_complete"].all())
+    ttc_complete = complete and bool(annual_billing["vat_cost_chf"].notna().all())
+    has_export = flux_available(priced, "export")
 
-    first, second, third, fourth = st.columns(4)
+    first, second, third, fourth, fifth = st.columns(5)
     with first:
         metric_with_caption(
             "Coût variable import",
@@ -604,9 +687,13 @@ def show_tariff_results(
     with second:
         metric_with_caption(
             "Reprise PV",
-            chf(export_revenue, 0),
-            f"{kwh(export_priced)} tarifés sur {kwh(export_total)}"
-            + (" · GO incluse" if include_go else " · hors GO"),
+            chf(export_revenue, 0) if has_export else "Donnée non fournie",
+            (
+                f"{kwh(export_priced)} tarifés sur {kwh(export_total)}"
+                + (" · GO incluse" if include_go else " · hors GO")
+                if has_export
+                else "Le fichier ne contient pas l’injection réseau."
+            ),
         )
     with third:
         metric_with_caption(
@@ -616,36 +703,59 @@ def show_tariff_results(
         )
     with fourth:
         metric_with_caption(
-            "Solde estimé",
+            "Solde estimé HT",
             chf(net_cost, 0) if complete else "À compléter",
             "Coût import − reprise PV + frais fixes",
+        )
+    with fifth:
+        metric_with_caption(
+            "Solde estimé TTC",
+            chf(net_cost_ttc, 0) if complete and net_cost_ttc is not None else "À compléter",
+            f"TVA achats : {chf(vat_cost, 0)}"
+            if vat_cost is not None
+            else "TVA non renseignée",
         )
 
     unpriced_import = energy_sum(priced, "import_unpriced_kwh")
     unpriced_export = energy_sum(priced, "export_unpriced_kwh")
     if not complete:
         messages = []
-        if unpriced_import > 0.01:
+        if unpriced_import is not None and unpriced_import > 0.01:
             messages.append(f"{kwh(unpriced_import)} d’import sans les quatre tarifs variables")
-        if unpriced_export > 0.01:
+        if has_export and unpriced_export is not None and unpriced_export > 0.01:
             messages.append(f"{kwh(unpriced_export)} d’injection sans reprise confirmée")
         missing_import = int(annual_billing["import_missing_intervals"].sum())
         missing_export = int(annual_billing["export_missing_intervals"].sum())
-        if missing_import or missing_export:
+        if missing_import or (missing_export and has_export):
             messages.append(
-                f"{swiss_number(missing_import + missing_export)} pas de mesure incomplet(s)"
+                f"{swiss_number(missing_import + (missing_export if has_export else 0))} "
+                "pas de mesure incomplet(s)"
             )
+        if not has_export:
+            messages.append("injection réseau non fournie par le fichier")
         if not bool(annual_billing["fixed_complete"].all()):
-            messages.append("au moins un frais fixe mensuel non renseigné")
+            messages.append("au moins un frais fixe mensuel ou annuel est incomplet")
+        if bool(annual_billing.get("fixed_rate_conflict", pd.Series(False)).any()):
+            messages.append("un même frais fixe est renseigné au mois et à l’année")
         st.warning(
             "Le solde complet n’est pas affiché : "
             + ("; ".join(messages) if messages else "un paramètre reste incomplet")
             + ". Complétez les cellules manquantes plutôt que d’interpréter un zéro."
         )
+    elif not ttc_complete:
+        st.info(
+            "Les postes hors TVA couvrent la période analysée. Renseignez la TVA achats "
+            "pour afficher un solde TTC."
+        )
     else:
         st.success(
             "Tous les postes saisis couvrent la période analysée. Vérifiez néanmoins le produit, "
             "les taxes locales et la TVA avec la facture client."
+        )
+    if include_go and apply_export_total_cap:
+        st.caption(
+            "Le plafond de reprise total est appliqué lorsqu’il est renseigné. "
+            "Ne l’activez que si les conditions contractuelles sont confirmées."
         )
 
     st.plotly_chart(billing_components_chart(annual_billing), width="stretch")
@@ -661,6 +771,8 @@ def show_tariff_results(
             "fixed_cost_chf",
             "export_revenue_chf",
             "net_estimated_cost_chf",
+            "vat_cost_chf",
+            "net_estimated_cost_ttc_chf",
             "is_complete",
         ]
     ].rename(
@@ -674,7 +786,9 @@ def show_tariff_results(
             "taxes_cost_chf": "Taxes [CHF]",
             "fixed_cost_chf": "Frais fixes [CHF]",
             "export_revenue_chf": "Reprise PV [CHF]",
-            "net_estimated_cost_chf": "Solde estimé [CHF]",
+            "net_estimated_cost_chf": "Solde HT [CHF]",
+            "vat_cost_chf": "TVA [CHF]",
+            "net_estimated_cost_ttc_chf": "Solde TTC [CHF]",
             "is_complete": "Complet",
         }
     )
@@ -689,7 +803,9 @@ def show_tariff_results(
             "Taxes [CHF]": "{:,.2f}",
             "Frais fixes [CHF]": "{:,.2f}",
             "Reprise PV [CHF]": "{:,.2f}",
-            "Solde estimé [CHF]": "{:,.2f}",
+            "Solde HT [CHF]": "{:,.2f}",
+            "TVA [CHF]": "{:,.2f}",
+            "Solde TTC [CHF]": "{:,.2f}",
         },
     )
 
@@ -704,6 +820,8 @@ def show_tariff_results(
             "fixed_cost_chf",
             "export_revenue_chf",
             "net_estimated_cost_chf",
+            "vat_cost_chf",
+            "net_estimated_cost_ttc_chf",
             "is_complete",
         ]
     ].rename(
@@ -714,7 +832,9 @@ def show_tariff_results(
             "import_variable_cost_chf": "Coût variable [CHF]",
             "fixed_cost_chf": "Frais fixes [CHF]",
             "export_revenue_chf": "Reprise PV [CHF]",
-            "net_estimated_cost_chf": "Solde estimé [CHF]",
+            "net_estimated_cost_chf": "Solde HT [CHF]",
+            "vat_cost_chf": "TVA [CHF]",
+            "net_estimated_cost_ttc_chf": "Solde TTC [CHF]",
             "is_complete": "Complet",
         }
     )
@@ -726,7 +846,9 @@ def show_tariff_results(
             "Coût variable [CHF]": "{:,.2f}",
             "Frais fixes [CHF]": "{:,.2f}",
             "Reprise PV [CHF]": "{:,.2f}",
-            "Solde estimé [CHF]": "{:,.2f}",
+            "Solde HT [CHF]": "{:,.2f}",
+            "TVA [CHF]": "{:,.2f}",
+            "Solde TTC [CHF]": "{:,.2f}",
         },
     )
 
@@ -741,8 +863,11 @@ def show_tariff_results(
             "export_kwh",
             "energy_rate_ct_kwh",
             "go_rate_ct_kwh",
+            "effective_rate_ct_kwh",
+            "total_cap_ct_kwh",
             "energy_revenue_chf",
             "go_revenue_chf",
+            "cap_adjustment_chf",
             "export_revenue_chf",
             "export_unpriced_kwh",
         ]
@@ -752,8 +877,11 @@ def show_tariff_results(
             "export_kwh": "Injection [kWh]",
             "energy_rate_ct_kwh": "Énergie [ct/kWh]",
             "go_rate_ct_kwh": "GO [ct/kWh]",
+            "effective_rate_ct_kwh": "Tarif appliqué [ct/kWh]",
+            "total_cap_ct_kwh": "Plafond total [ct/kWh]",
             "energy_revenue_chf": "Reprise énergie [CHF]",
             "go_revenue_chf": "GO [CHF]",
+            "cap_adjustment_chf": "Ajustement plafond [CHF]",
             "export_revenue_chf": "Reprise totale [CHF]",
             "export_unpriced_kwh": "Injection non tarifée [kWh]",
         }
@@ -764,8 +892,11 @@ def show_tariff_results(
             "Injection [kWh]": "{:,.0f}",
             "Énergie [ct/kWh]": "{:,.3f}",
             "GO [ct/kWh]": "{:,.3f}",
+            "Tarif appliqué [ct/kWh]": "{:,.3f}",
+            "Plafond total [ct/kWh]": "{:,.3f}",
             "Reprise énergie [CHF]": "{:,.2f}",
             "GO [CHF]": "{:,.2f}",
+            "Ajustement plafond [CHF]": "{:,.2f}",
             "Reprise totale [CHF]": "{:,.2f}",
             "Injection non tarifée [kWh]": "{:,.0f}",
         },
@@ -779,7 +910,8 @@ def show_profile_tab(metrics: dict[str, object], settings: AnalysisSettings) -> 
         "il retient le minimum entre l’injection de la fenêtre solaire et le "
         "soutirage hors de cette fenêtre. Il ne constitue pas une économie garantie."
     )
-    first, second, third, fourth = st.columns(4)
+    export_available = bool(metrics.get("export_available", True))
+    first, second, third = st.columns(3)
     with first:
         metric_with_caption(
             f"Import nuit ({settings.night_start_hour} h–{settings.night_end_hour} h)",
@@ -788,86 +920,91 @@ def show_profile_tab(metrics: dict[str, object], settings: AnalysisSettings) -> 
             f"{kwh(metrics['night_import_kwh_per_day'], 1)}/jour",
         )
     with second:
-        metric_with_caption(
-            f"Injection {settings.solar_start_hour} h–{settings.solar_end_hour} h",
-            kwh(metrics["solar_export_kwh"]),
-            f"{kwh(metrics['solar_export_kwh_per_day'], 1)}/jour",
-        )
+        if export_available:
+            metric_with_caption(
+                f"Injection {settings.solar_start_hour} h–{settings.solar_end_hour} h",
+                kwh(metrics["solar_export_kwh"]),
+                f"{kwh(metrics['solar_export_kwh_per_day'], 1)}/jour",
+            )
+        else:
+            metric_with_caption(
+                "Injection solaire",
+                "Donnée non fournie",
+                "Le fichier ne contient pas l’excédent réseau",
+            )
     with third:
-        metric_with_caption(
-            "Potentiel de décalage",
-            kwh(metrics["shiftable_ceiling_kwh"]),
-            f"Plafond : {kwh(metrics['shiftable_ceiling_kwh_per_day'], 1)}/jour",
-        )
-    with fourth:
-        metric_with_caption(
-            "Surplus actif moyen",
-            kw(metrics["active_export_average_kw"]),
-            f"{hours(metrics['active_export_hours'])} avec injection > 0,10 kW",
-        )
+        if export_available:
+            metric_with_caption(
+                "Potentiel de décalage",
+                kwh(metrics["shiftable_ceiling_kwh"]),
+                f"Plafond : {kwh(metrics['shiftable_ceiling_kwh_per_day'], 1)}/jour",
+            )
+        else:
+            metric_with_caption(
+                "Potentiel de décalage",
+                "À compléter",
+                "Il faut l’injection réseau pour le chiffrer",
+            )
 
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(
-            threshold_hours_chart(metrics["hours_above_kw"]),
-            width="stretch",
-        )
-        thresholds = pd.DataFrame(
-            {
-                "Seuil d’injection": [f">{value} kW" for value in metrics["hours_above_kw"]],
-                "Durée observée [h]": list(metrics["hours_above_kw"].values()),
-            }
-        )
-        dataframe_with_number_format(thresholds, {"Durée observée [h]": "{:,.0f}"})
-    with right:
+    if export_available:
         st.plotly_chart(seasonal_energy_chart(metrics), width="stretch")
         st.caption(
             "Les saisons correspondent à : printemps (mars–mai), été (juin–août), "
             "automne (septembre–novembre) et hiver (décembre–février)."
         )
-
-    st.subheader("Plages de soutirage récurrentes à investiguer")
-    recurring = metrics["recurring_windows"]
-    if recurring.empty:
-        st.info(
-            "Aucune plage suffisamment récurrente n’a été retenue avec les seuils prudents actuels."
-        )
     else:
-        st.caption(
-            "Ces plages indiquent un comportement à rapprocher des équipements et "
-            "programmations réels ; elles n’identifient pas un appareil automatiquement."
+        st.info(
+            "Le diagnostic de consommation reste exploitable. Ajoutez l’excédent réseau pour "
+            "quantifier le surplus solaire et les actions de pilotage associées."
         )
-        display = recurring[
-            ["Plage", "Puissance médiane [kW]", "duration_h", "Fréquence"]
-        ].rename(
-            columns={
-                "duration_h": "Durée [h]",
-                "Fréquence": "Fréquence des jours",
-            }
-        )
-        dataframe_with_number_format(
-            display,
-            {
-                "Puissance médiane [kW]": "{:,.2f}",
-                "Durée [h]": "{:,.2f}",
-                "Fréquence des jours": "{:.0%}",
-            },
-        )
+
+    with st.expander("Indices techniques à vérifier avec le client", expanded=False):
+        if export_available:
+            st.plotly_chart(threshold_hours_chart(metrics["hours_above_kw"]), width="stretch")
+            thresholds = pd.DataFrame(
+                {
+                    "Seuil d’injection": [
+                        f">{value} kW" for value in metrics["hours_above_kw"]
+                    ],
+                    "Durée observée [h]": list(metrics["hours_above_kw"].values()),
+                }
+            )
+            dataframe_with_number_format(thresholds, {"Durée observée [h]": "{:,.0f}"})
+        recurring = metrics["recurring_windows"]
+        if recurring.empty:
+            st.caption("Aucune plage de soutirage suffisamment récurrente n’a été retenue.")
+        else:
+            display = recurring[
+                ["Plage", "Puissance médiane [kW]", "duration_h", "Fréquence"]
+            ].rename(
+                columns={
+                    "duration_h": "Durée [h]",
+                    "Fréquence": "Fréquence des jours",
+                }
+            )
+            dataframe_with_number_format(
+                display,
+                {
+                    "Puissance médiane [kW]": "{:,.2f}",
+                    "Durée [h]": "{:,.2f}",
+                    "Fréquence des jours": "{:.0%}",
+                },
+            )
 
 
 def show_typical_days_tab(
     data: pd.DataFrame, selected_years: list[int], settings: AnalysisSettings
 ) -> None:
     st.subheader("Journées types saisonnières")
-    mode = st.radio(
-        "Affichage",
-        ("Comparer les années", "Moyenne globale des années sélectionnées"),
-        horizontal=True,
-    )
     st.caption(
         "Chaque courbe est la moyenne des mesures réelles à chaque quart d’heure. "
         "L’import est affiché au-dessus de zéro ; l’injection, en pointillé, au-dessous."
     )
+    compare_years = False
+    with st.expander("Comparer les années - conseiller", expanded=False):
+        compare_years = st.checkbox(
+            "Afficher une courbe par année", value=False, key="typical_days_compare_years"
+        )
     slots = list(st.columns(2)) + list(st.columns(2))
     for slot, season in zip(slots, SEASON_ORDER):
         with slot:
@@ -875,7 +1012,7 @@ def show_typical_days_tab(
                 data,
                 season,
                 selected_years,
-                grouped=mode.startswith("Moyenne"),
+                grouped=not compare_years,
             )
             if profile.empty:
                 st.info(f"Pas de mesure disponible pour {season.lower()}.")
@@ -893,14 +1030,16 @@ def show_typical_days_tab(
 
 
 def show_recommendations_tab(
-    metrics: dict[str, object], quality, settings: AnalysisSettings
+    metrics: dict[str, object],
+    settings: AnalysisSettings,
+    recommendations: list[dict[str, object]],
 ) -> None:
     st.subheader("Conseils Soleol")
     st.markdown(
         f'<div class="client-summary">{client_summary(metrics, settings)}</div>',
         unsafe_allow_html=True,
     )
-    for recommendation in build_recommendations(metrics, quality, settings):
+    for recommendation in recommendations:
         evidence = "".join(f"<li>{item}</li>" for item in recommendation["evidence"])
         evidence_html = f"<ul>{evidence}</ul>" if evidence else ""
         st.markdown(
@@ -926,12 +1065,50 @@ def show_data_tab(
     annual: pd.DataFrame,
     monthly: pd.DataFrame,
     quality,
-    convention: str,
     annual_billing: pd.DataFrame,
     monthly_billing: pd.DataFrame,
     export_rate_table: pd.DataFrame,
+    metadata: dict[str, str],
+    grd: str,
+    offer: str,
+    metrics: dict[str, object],
+    recommendations: list[dict[str, object]],
+    settings: AnalysisSettings,
 ) -> None:
-    st.subheader("Qualité des données et export")
+    st.subheader("Rapport client PDF")
+    st.caption(
+        "Une synthèse visuelle Soleol : résultats clés, profil saisonnier et actions prioritaires."
+    )
+    default_client = metadata.get("Objet") or metadata.get("Adresse") or "Client"
+    report_client_name = st.text_input(
+        "Nom affiché sur le rapport",
+        value=default_client,
+        key="report_client_name",
+    )
+    try:
+        report_bytes = generate_energy_report(
+            client_name=report_client_name,
+            grd=grd,
+            offer=offer,
+            data=data,
+            monthly=monthly,
+            metrics=metrics,
+            annual_billing=annual_billing,
+            recommendations=recommendations,
+            conclusion=client_summary(metrics, settings),
+        )
+        st.download_button(
+            "Télécharger le rapport PDF client",
+            data=report_bytes,
+            file_name="rapport_conseil_energetique_soleol.pdf",
+            mime="application/pdf",
+            type="primary",
+        )
+    except Exception as exc:  # noqa: BLE001 - l'interface doit rester utilisable.
+        st.warning(f"Le rapport PDF n’a pas pu être généré : {exc}")
+
+    st.divider()
+    st.subheader("Données et exports conseiller")
     left, middle, right, fourth = st.columns(4)
     with left:
         metric_with_caption("Mesures lues", swiss_number(quality.imported_rows))
@@ -947,14 +1124,9 @@ def show_data_tab(
         )
 
     st.caption(
-        "Convention active : "
-        + (
-            "horodatage de fin d’intervalle (format Groupe E)."
-            if convention == "end"
-            else "horodatage de début d’intervalle."
-        )
-        + " Les dates Excel sans fuseau sont conservées telles quelles ; l’heure répétée "
-        "au passage à l’heure d’hiver n’est jamais reconstruite artificiellement."
+        "La convention horaire est appliquée automatiquement selon le format fournisseur : "
+        "Groupe E en fin d’intervalle ; CSV Romande Energie en début d’intervalle. "
+        "Les doublons sont contrôlés sur l’instant réel, y compris au changement d’heure."
     )
     source_table = pd.DataFrame(quality.source_rows)
     if not source_table.empty:
@@ -1026,78 +1198,7 @@ def show_data_tab(
 def main() -> None:
     inject_style()
     with st.sidebar:
-        st.markdown("## Données d’analyse")
-        uploaded_files = st.file_uploader(
-            "Courbes Excel",
-            type=["xlsx", "xlsm"],
-            accept_multiple_files=True,
-            help="Une colonne Date et une colonne Soutirage/Import ou Surplus/Export sont recherchées automatiquement.",
-        )
-        st.markdown("---")
-        st.markdown("### Convention de date")
-        convention_label = st.radio(
-            "Les dates indiquent",
-            (
-                "La fin de l’intervalle — Groupe E",
-                "Le début de l’intervalle",
-            ),
-            help=(
-                "Les fichiers Groupe E testés commencent à 00:15 et se terminent à 00:00 "
-                "le lendemain : ils sont donc interprétés comme des fins de quart d’heure."
-            ),
-        )
-        st.markdown("### Fenêtres de diagnostic")
-        with st.expander("Adapter les heures", expanded=False):
-            night_start = st.slider("Début nuit", 0, 23, 23)
-            night_end = st.slider("Fin nuit", 0, 23, 6)
-            solar_start = st.slider("Début fenêtre solaire", 0, 23, 10)
-            solar_end = st.slider("Fin fenêtre solaire", 1, 24, 16)
-
-    if not uploaded_files:
-        show_empty_state()
-        return
-
-    imported: list[ImportedFile] = []
-    errors: list[str] = []
-    with st.spinner("Lecture et contrôle des courbes…"):
-        for uploaded in uploaded_files:
-            try:
-                imported.append(parse_uploaded_file(uploaded.name, uploaded.getvalue()))
-            except Exception as exc:  # noqa: BLE001 - message utile au conseiller.
-                errors.append(f"{uploaded.name} : {exc}")
-    for error in errors:
-        st.error(error)
-    if not imported:
-        return
-
-    combined, quality = combine_imports(imported)
-    convention = "end" if convention_label.startswith("La fin") else "start"
-    settings = AnalysisSettings(
-        night_start_hour=night_start,
-        night_end_hour=night_end,
-        solar_start_hour=solar_start,
-        solar_end_hour=solar_end,
-        timestamp_convention=convention,
-    )
-    all_data = add_analysis_flags(apply_timestamp_convention(combined, convention), settings)
-    available_years = sorted(all_data["year"].unique().tolist())
-    if not available_years:
-        st.error("Aucune date exploitable n’a été trouvée.")
-        return
-
-    with st.sidebar:
-        st.markdown("---")
-        selected_years = st.multiselect(
-            "Années affichées",
-            available_years,
-            default=available_years,
-        )
-    if not selected_years:
-        st.warning("Sélectionnez au moins une année.")
-        return
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("### Profil GRD")
+        st.markdown("## Tarifs GRD")
         grd = st.selectbox(
             "Gestionnaire de réseau",
             GRD_NAMES,
@@ -1108,10 +1209,67 @@ def main() -> None:
             offers_for_grd(grd),
             help="Vérifiez toujours le produit effectivement indiqué sur la facture du client.",
         )
+        st.caption(
+            "Les horaires HT/BT, les composantes de facture et la reprise PV se "
+            "paramètrent ensuite dans l’onglet « Tarifs GRD »."
+        )
+
+    # La colonne latérale reste réservée aux tarifs. Les courbes sont chargées
+    # au centre afin de séparer clairement le choix du GRD des mesures client.
+    has_curves = bool(st.session_state.get("soleol_curve_files"))
+    with st.expander("Courbes de mesure", expanded=not has_curves):
+        uploaded_files = st.file_uploader(
+            "Ajouter ou remplacer les courbes",
+            type=["xlsx", "xlsm", "csv"],
+            accept_multiple_files=True,
+            key="soleol_curve_files",
+            help=(
+                "Groupe E : fichiers Excel en kW. Romande Energie : exports CSV en kWh "
+                "par intervalle. Les colonnes Date, consommation et injection sont détectées."
+            ),
+        )
+
+    if not uploaded_files:
+        show_empty_state()
+        return
+
+    imported: list[ImportedFile] = []
+    errors: list[str] = []
+    with st.spinner("Lecture et contrôle des courbes…"):
+        for uploaded in uploaded_files:
+            try:
+                imported.append(parse_uploaded_file(uploaded.name, uploaded.getvalue(), grd))
+            except Exception as exc:  # noqa: BLE001 - message utile au conseiller.
+                errors.append(f"{uploaded.name} : {exc}")
+    for error in errors:
+        st.error(error)
+    if not imported:
+        return
+
+    combined, quality = combine_imports(imported)
+    settings = AnalysisSettings()
+    all_data = add_analysis_flags(apply_timestamp_convention(combined), settings)
+    available_years = sorted(all_data["year"].unique().tolist())
+    if not available_years:
+        st.error("Aucune date exploitable n’a été trouvée.")
+        return
+
+    with st.sidebar:
+        st.divider()
+        selected_years = st.multiselect(
+            "Années analysées et tarifées",
+            available_years,
+            default=available_years,
+            help="Les tarifs et la reprise PV sont appliqués selon chacune des années retenues.",
+        )
+    if not selected_years:
+        st.warning("Sélectionnez au moins une année.")
+        return
     data = all_data[all_data["year"].isin(selected_years)].copy()
     annual = annual_summary(data)
     monthly = monthly_summary(data)
     metrics = profile_metrics(data, settings)
+    recommendations = build_recommendations(metrics, quality, settings)
 
     show_header(client_metadata(imported), data)
     tabs = st.tabs(
@@ -1121,14 +1279,20 @@ def main() -> None:
             "Profil & pilotage",
             "Journées types",
             "Conseils Soleol",
-            "Données & export",
+            "Rapport & export",
         ]
     )
     with tabs[1]:
-        rates_by_year, include_go, export_rate_table = show_tariff_configuration(
-            grd, offer, selected_years
+        rates_by_year, include_go, apply_export_total_cap, export_rate_table = (
+            show_tariff_configuration(grd, offer, selected_years)
         )
-    priced = apply_billing_rates(data, grd, rates_by_year, include_go=include_go)
+    priced = apply_billing_rates(
+        data,
+        grd,
+        rates_by_year,
+        include_go=include_go,
+        apply_export_total_cap=apply_export_total_cap,
+    )
     fixed_billing = fixed_charges_by_month(priced, rates_by_year)
     annual_billing = billing_summary(priced, fixed_billing)
     monthly_billing = monthly_billing_summary(priced, fixed_billing)
@@ -1143,23 +1307,29 @@ def main() -> None:
             quarterly_billing,
             grd,
             include_go,
+            apply_export_total_cap,
         )
     with tabs[2]:
         show_profile_tab(metrics, settings)
     with tabs[3]:
         show_typical_days_tab(data, selected_years, settings)
     with tabs[4]:
-        show_recommendations_tab(metrics, quality, settings)
+        show_recommendations_tab(metrics, settings, recommendations)
     with tabs[5]:
         show_data_tab(
             data,
             annual,
             monthly,
             quality,
-            convention,
             annual_billing,
             monthly_billing,
             export_rate_table,
+            client_metadata(imported),
+            grd,
+            offer,
+            metrics,
+            recommendations,
+            settings,
         )
 
 
