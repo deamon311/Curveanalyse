@@ -35,6 +35,10 @@ def kw(value: float | int | None, decimals: int = 2) -> str:
     return f"{swiss_number(value, decimals)} kW"
 
 
+def chf(value: float | int | None, decimals: int = 0) -> str:
+    return f"CHF {swiss_number(value, decimals)}"
+
+
 def pct(value: float | int | None, decimals: int = 1, sign: bool = False) -> str:
     prefix = "+" if sign and value is not None and value > 0 else ""
     return f"{prefix}{swiss_number(value, decimals)} %"

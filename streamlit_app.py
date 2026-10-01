@@ -14,14 +14,17 @@ import streamlit as st
 
 from energy_analysis.charts import (
     annual_energy_chart,
+    billing_components_chart,
     comparable_energy_chart,
+    monthly_billing_chart,
     monthly_energy_chart,
     seasonal_energy_chart,
     threshold_hours_chart,
     typical_day_chart,
 )
 from energy_analysis.config import BRAND_ORANGE, SEASON_ORDER, AnalysisSettings
-from energy_analysis.formatting import hours, kw, kwh, pct, swiss_number
+from energy_analysis.formatting import chf, hours, kw, kwh, pct, swiss_number
+from energy_analysis.grd_profiles import GRD_NAMES, offers_for_grd, profile_for_year
 from energy_analysis.ingest import (
     apply_timestamp_convention,
     combine_imports,
@@ -37,6 +40,15 @@ from energy_analysis.metrics import (
 )
 from energy_analysis.models import ImportedFile
 from energy_analysis.recommendations import build_recommendations, client_summary
+from energy_analysis.tariffs import (
+    apply_billing_rates,
+    billing_summary,
+    default_rate_tables,
+    fixed_charges_by_month,
+    monthly_billing_summary,
+    quarterly_export_summary,
+    rates_from_tables,
+)
 
 st.set_page_config(
     page_title="Analyse énergétique | Soleol",
@@ -199,12 +211,155 @@ def show_header(metadata: dict[str, str], data: pd.DataFrame) -> None:
         <div class="soleol-hero">
             <div class="soleol-kicker">Conseil énergétique photovoltaïque</div>
             <div class="soleol-brand">SOLEOL</div>
-            <div class="soleol-title">Analyse de courbes de charge</div>
+            <div class="soleol-title">Analyse de courbes de charge et tarifs GRD</div>
             <div class="soleol-subtitle">{subtitle} · Période analysée : {period}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+VARIABLE_RATE_LABELS = {
+    "energy_ht_ct_kwh": "Énergie HT [ct/kWh]",
+    "energy_bt_ct_kwh": "Énergie BT [ct/kWh]",
+    "distribution_ht_ct_kwh": "Distribution HT [ct/kWh]",
+    "distribution_bt_ct_kwh": "Distribution BT [ct/kWh]",
+    "swissgrid_ht_ct_kwh": "Swissgrid HT [ct/kWh]",
+    "swissgrid_bt_ct_kwh": "Swissgrid BT [ct/kWh]",
+    "taxes_ht_ct_kwh": "Taxes HT [ct/kWh]",
+    "taxes_bt_ct_kwh": "Taxes BT [ct/kWh]",
+}
+FIXED_RATE_LABELS = {
+    "energy_fixed_chf_month": "Énergie [CHF/mois]",
+    "distribution_fixed_chf_month": "Distribution & mesure [CHF/mois]",
+    "swissgrid_fixed_chf_month": "Swissgrid [CHF/mois]",
+    "taxes_fixed_chf_month": "Taxes [CHF/mois]",
+}
+
+
+def tariff_table_key(grd: str, offer: str, years: list[int], table: str) -> str:
+    years_key = "_".join(str(year) for year in years)
+    return f"tariff_{table}_{grd}_{offer}_{years_key}"
+
+
+def show_tariff_configuration(
+    grd: str, offer: str, years: list[int]
+) -> tuple[dict[int, dict[str, object]], bool, pd.DataFrame]:
+    """Affiche et lit les montants servant à l'estimation tarifaire."""
+
+    st.subheader("Tarif GRD et paramètres de facture")
+    st.caption(
+        "Cette première version cible le tarif double basse tension. Les montants sont "
+        "appliqués aux kWh mesurés ; ils restent modifiables et ne remplacent pas une facture."
+    )
+    schedules = []
+    for year in years:
+        schedule = profile_for_year(grd, year)
+        schedules.append(
+            {
+                "Année": year,
+                "Horaires appliqués": schedule["label"],
+                "Statut": (
+                    "À confirmer — calendrier repris d’une autre année"
+                    if schedule["schedule_needs_confirmation"]
+                    else "Calendrier intégré — tarif double"
+                ),
+            }
+        )
+    st.dataframe(pd.DataFrame(schedules), width="stretch", hide_index=True)
+    if any(profile_for_year(grd, year)["schedule_needs_confirmation"] for year in years):
+        st.warning(
+            "Au moins une année ne dispose pas encore d’un calendrier officiel dans l’application. "
+            "Le dernier calendrier connu est proposé uniquement comme repère."
+        )
+
+    variable_defaults, fixed_defaults, export_defaults, notes = default_rate_tables(
+        grd, years, offer
+    )
+    if grd == "Groupe E":
+        st.info(
+            "Les horaires Groupe E sont intégrés. Les prix du fichier fourni sont globaux et "
+            "non ventilés : renseignez les quatre composantes de la facture client avant de "
+            "lire une estimation de coût complète."
+        )
+    else:
+        st.info(
+            "Les préremplissages Romande Energie correspondent au tarif Double, offre "
+            "Energie Suisse/Romande, hors TVA et hors taxes cantonales ou communales."
+        )
+    for note in notes:
+        st.caption(note)
+
+    variable_config = {
+        "Année": st.column_config.NumberColumn("Année", format="%d"),
+        **{
+            column: st.column_config.NumberColumn(label, min_value=0.0, step=0.001)
+            for column, label in VARIABLE_RATE_LABELS.items()
+        },
+    }
+    fixed_config = {
+        "Année": st.column_config.NumberColumn("Année", format="%d"),
+        **{
+            column: st.column_config.NumberColumn(label, min_value=0.0, step=0.01)
+            for column, label in FIXED_RATE_LABELS.items()
+        },
+    }
+    export_config = {
+        "Année": st.column_config.NumberColumn("Année", format="%d"),
+        "Trimestre": st.column_config.NumberColumn("Trimestre", format="T%d"),
+        "energy_ct_kwh": st.column_config.NumberColumn(
+            "Reprise énergie [ct/kWh]", min_value=0.0, step=0.001
+        ),
+        "go_ct_kwh": st.column_config.NumberColumn("GO [ct/kWh]", min_value=0.0, step=0.001),
+        "Source": st.column_config.TextColumn("Source", width="medium"),
+        "Note": st.column_config.TextColumn("Note", width="large"),
+    }
+
+    st.markdown("#### Montants variables hors TVA")
+    variable_rates = st.data_editor(
+        variable_defaults,
+        column_config=variable_config,
+        disabled=["Année"],
+        hide_index=True,
+        num_rows="fixed",
+        width="stretch",
+        key=tariff_table_key(grd, offer, years, "variable"),
+    )
+    st.markdown("#### Frais fixes hors TVA")
+    st.caption(
+        "Les frais fixes sont indiqués en CHF/mois et proratisés selon les jours calendaires "
+        "présents dans la période analysée. Mettre 0 lorsqu’aucun frais ne s’applique."
+    )
+    fixed_rates = st.data_editor(
+        fixed_defaults,
+        column_config=fixed_config,
+        disabled=["Année"],
+        hide_index=True,
+        num_rows="fixed",
+        width="stretch",
+        key=tariff_table_key(grd, offer, years, "fixed"),
+    )
+    st.markdown("#### Reprise photovoltaïque par trimestre")
+    include_go = st.checkbox(
+        "Inclure la rémunération des garanties d’origine (GO)",
+        value=False,
+        help="À activer uniquement si le client a effectivement cédé ses garanties d’origine au GRD.",
+        key=tariff_table_key(grd, offer, years, "go"),
+    )
+    st.caption(
+        "Les cellules vides signifient « tarif non publié ou non confirmé », jamais 0 ct/kWh. "
+        "Les valeurs de reprise doivent être vérifiées sur la facture ou le contrat client."
+    )
+    export_rates = st.data_editor(
+        export_defaults,
+        column_config=export_config,
+        disabled=["Année", "Trimestre", "Source", "Note"],
+        hide_index=True,
+        num_rows="fixed",
+        width="stretch",
+        key=tariff_table_key(grd, offer, years, "export"),
+    )
+    return rates_from_tables(variable_rates, fixed_rates, export_rates), include_go, export_rates
 
 
 def show_empty_state() -> None:
@@ -404,6 +559,219 @@ def show_summary_tab(
     )
 
 
+def tariff_sum(summary: pd.DataFrame, column: str) -> float | None:
+    value = summary[column].sum(min_count=1)
+    return float(value) if pd.notna(value) else None
+
+
+def show_tariff_results(
+    priced: pd.DataFrame,
+    annual_billing: pd.DataFrame,
+    monthly_billing: pd.DataFrame,
+    quarterly_billing: pd.DataFrame,
+    grd: str,
+    include_go: bool,
+) -> None:
+    """Affiche la lecture client de l'estimation tarifaire paramétrée."""
+
+    st.divider()
+    st.subheader("Estimation de facture sur les flux réseau mesurés")
+    st.caption(
+        "Montants hors TVA, hors éventuelle composante puissance et hors postes non renseignés. "
+        "La reprise PV est une recette distincte ; elle ne comprend ni réseau ni taxes."
+    )
+    if annual_billing.empty:
+        st.info("Aucune mesure tarifable n’est disponible.")
+        return
+
+    import_total = energy_sum(priced, "import_kwh")
+    export_total = energy_sum(priced, "export_kwh")
+    import_priced = energy_sum(priced, "import_priced_kwh")
+    export_priced = energy_sum(priced, "export_priced_kwh")
+    import_cost = tariff_sum(annual_billing, "import_variable_cost_chf")
+    export_revenue = tariff_sum(annual_billing, "export_revenue_chf")
+    fixed_cost = tariff_sum(annual_billing, "fixed_cost_chf")
+    net_cost = tariff_sum(annual_billing, "net_estimated_cost_chf")
+    complete = bool(annual_billing["is_complete"].all())
+
+    first, second, third, fourth = st.columns(4)
+    with first:
+        metric_with_caption(
+            "Coût variable import",
+            chf(import_cost, 0),
+            f"{kwh(import_priced)} tarifés sur {kwh(import_total)}",
+        )
+    with second:
+        metric_with_caption(
+            "Reprise PV",
+            chf(export_revenue, 0),
+            f"{kwh(export_priced)} tarifés sur {kwh(export_total)}"
+            + (" · GO incluse" if include_go else " · hors GO"),
+        )
+    with third:
+        metric_with_caption(
+            "Frais fixes estimés",
+            chf(fixed_cost, 0),
+            "Prorata des jours calendaires analysés",
+        )
+    with fourth:
+        metric_with_caption(
+            "Solde estimé",
+            chf(net_cost, 0) if complete else "À compléter",
+            "Coût import − reprise PV + frais fixes",
+        )
+
+    unpriced_import = energy_sum(priced, "import_unpriced_kwh")
+    unpriced_export = energy_sum(priced, "export_unpriced_kwh")
+    if not complete:
+        messages = []
+        if unpriced_import > 0.01:
+            messages.append(f"{kwh(unpriced_import)} d’import sans les quatre tarifs variables")
+        if unpriced_export > 0.01:
+            messages.append(f"{kwh(unpriced_export)} d’injection sans reprise confirmée")
+        missing_import = int(annual_billing["import_missing_intervals"].sum())
+        missing_export = int(annual_billing["export_missing_intervals"].sum())
+        if missing_import or missing_export:
+            messages.append(
+                f"{swiss_number(missing_import + missing_export)} pas de mesure incomplet(s)"
+            )
+        if not bool(annual_billing["fixed_complete"].all()):
+            messages.append("au moins un frais fixe mensuel non renseigné")
+        st.warning(
+            "Le solde complet n’est pas affiché : "
+            + ("; ".join(messages) if messages else "un paramètre reste incomplet")
+            + ". Complétez les cellules manquantes plutôt que d’interpréter un zéro."
+        )
+    else:
+        st.success(
+            "Tous les postes saisis couvrent la période analysée. Vérifiez néanmoins le produit, "
+            "les taxes locales et la TVA avec la facture client."
+        )
+
+    st.plotly_chart(billing_components_chart(annual_billing), width="stretch")
+    annual_display = annual_billing[
+        [
+            "year",
+            "import_ht_kwh",
+            "import_bt_kwh",
+            "energy_cost_chf",
+            "distribution_cost_chf",
+            "swissgrid_cost_chf",
+            "taxes_cost_chf",
+            "fixed_cost_chf",
+            "export_revenue_chf",
+            "net_estimated_cost_chf",
+            "is_complete",
+        ]
+    ].rename(
+        columns={
+            "year": "Année",
+            "import_ht_kwh": "Import HT [kWh]",
+            "import_bt_kwh": "Import BT [kWh]",
+            "energy_cost_chf": "Énergie [CHF]",
+            "distribution_cost_chf": "Distribution [CHF]",
+            "swissgrid_cost_chf": "Swissgrid [CHF]",
+            "taxes_cost_chf": "Taxes [CHF]",
+            "fixed_cost_chf": "Frais fixes [CHF]",
+            "export_revenue_chf": "Reprise PV [CHF]",
+            "net_estimated_cost_chf": "Solde estimé [CHF]",
+            "is_complete": "Complet",
+        }
+    )
+    dataframe_with_number_format(
+        annual_display,
+        {
+            "Import HT [kWh]": "{:,.0f}",
+            "Import BT [kWh]": "{:,.0f}",
+            "Énergie [CHF]": "{:,.2f}",
+            "Distribution [CHF]": "{:,.2f}",
+            "Swissgrid [CHF]": "{:,.2f}",
+            "Taxes [CHF]": "{:,.2f}",
+            "Frais fixes [CHF]": "{:,.2f}",
+            "Reprise PV [CHF]": "{:,.2f}",
+            "Solde estimé [CHF]": "{:,.2f}",
+        },
+    )
+
+    st.subheader("Lecture mensuelle")
+    st.plotly_chart(monthly_billing_chart(monthly_billing), width="stretch")
+    monthly_display = monthly_billing[
+        [
+            "label",
+            "import_ht_kwh",
+            "import_bt_kwh",
+            "import_variable_cost_chf",
+            "fixed_cost_chf",
+            "export_revenue_chf",
+            "net_estimated_cost_chf",
+            "is_complete",
+        ]
+    ].rename(
+        columns={
+            "label": "Mois",
+            "import_ht_kwh": "Import HT [kWh]",
+            "import_bt_kwh": "Import BT [kWh]",
+            "import_variable_cost_chf": "Coût variable [CHF]",
+            "fixed_cost_chf": "Frais fixes [CHF]",
+            "export_revenue_chf": "Reprise PV [CHF]",
+            "net_estimated_cost_chf": "Solde estimé [CHF]",
+            "is_complete": "Complet",
+        }
+    )
+    dataframe_with_number_format(
+        monthly_display,
+        {
+            "Import HT [kWh]": "{:,.0f}",
+            "Import BT [kWh]": "{:,.0f}",
+            "Coût variable [CHF]": "{:,.2f}",
+            "Frais fixes [CHF]": "{:,.2f}",
+            "Reprise PV [CHF]": "{:,.2f}",
+            "Solde estimé [CHF]": "{:,.2f}",
+        },
+    )
+
+    st.subheader("Reprise PV par trimestre")
+    st.caption(
+        "La valorisation est affectée au trimestre civil de chaque kWh injecté. "
+        "Les trimestres sans prix confirmé ne sont pas valorisés."
+    )
+    quarterly_display = quarterly_billing[
+        [
+            "label",
+            "export_kwh",
+            "energy_rate_ct_kwh",
+            "go_rate_ct_kwh",
+            "energy_revenue_chf",
+            "go_revenue_chf",
+            "export_revenue_chf",
+            "export_unpriced_kwh",
+        ]
+    ].rename(
+        columns={
+            "label": "Trimestre",
+            "export_kwh": "Injection [kWh]",
+            "energy_rate_ct_kwh": "Énergie [ct/kWh]",
+            "go_rate_ct_kwh": "GO [ct/kWh]",
+            "energy_revenue_chf": "Reprise énergie [CHF]",
+            "go_revenue_chf": "GO [CHF]",
+            "export_revenue_chf": "Reprise totale [CHF]",
+            "export_unpriced_kwh": "Injection non tarifée [kWh]",
+        }
+    )
+    dataframe_with_number_format(
+        quarterly_display,
+        {
+            "Injection [kWh]": "{:,.0f}",
+            "Énergie [ct/kWh]": "{:,.3f}",
+            "GO [ct/kWh]": "{:,.3f}",
+            "Reprise énergie [CHF]": "{:,.2f}",
+            "GO [CHF]": "{:,.2f}",
+            "Reprise totale [CHF]": "{:,.2f}",
+            "Injection non tarifée [kWh]": "{:,.0f}",
+        },
+    )
+
+
 def show_profile_tab(metrics: dict[str, object], settings: AnalysisSettings) -> None:
     st.subheader("Profil et potentiel de pilotage")
     st.caption(
@@ -559,6 +927,9 @@ def show_data_tab(
     monthly: pd.DataFrame,
     quality,
     convention: str,
+    annual_billing: pd.DataFrame,
+    monthly_billing: pd.DataFrame,
+    export_rate_table: pd.DataFrame,
 ) -> None:
     st.subheader("Qualité des données et export")
     left, middle, right, fourth = st.columns(4)
@@ -605,7 +976,16 @@ def show_data_tab(
     monthly_export = monthly.copy()
     annual_csv = annual_export.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
     monthly_csv = monthly_export.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-    col_one, col_two = st.columns(2)
+    annual_billing_csv = annual_billing.to_csv(index=False, sep=";", decimal=",").encode(
+        "utf-8-sig"
+    )
+    monthly_billing_csv = monthly_billing.to_csv(index=False, sep=";", decimal=",").encode(
+        "utf-8-sig"
+    )
+    export_rates_csv = export_rate_table.to_csv(index=False, sep=";", decimal=",").encode(
+        "utf-8-sig"
+    )
+    col_one, col_two, col_three, col_four, col_five = st.columns(5)
     with col_one:
         st.download_button(
             "Télécharger la synthèse annuelle (CSV)",
@@ -618,6 +998,27 @@ def show_data_tab(
             "Télécharger la synthèse mensuelle (CSV)",
             data=monthly_csv,
             file_name="synthese_mensuelle_energie.csv",
+            mime="text/csv",
+        )
+    with col_three:
+        st.download_button(
+            "Télécharger l’estimation tarifaire annuelle (CSV)",
+            data=annual_billing_csv,
+            file_name="estimation_tarifaire_annuelle.csv",
+            mime="text/csv",
+        )
+    with col_four:
+        st.download_button(
+            "Télécharger l’estimation tarifaire mensuelle (CSV)",
+            data=monthly_billing_csv,
+            file_name="estimation_tarifaire_mensuelle.csv",
+            mime="text/csv",
+        )
+    with col_five:
+        st.download_button(
+            "Télécharger les paramètres de reprise (CSV)",
+            data=export_rates_csv,
+            file_name="parametres_reprise_pv.csv",
             mime="text/csv",
         )
 
@@ -694,6 +1095,19 @@ def main() -> None:
     if not selected_years:
         st.warning("Sélectionnez au moins une année.")
         return
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### Profil GRD")
+        grd = st.selectbox(
+            "Gestionnaire de réseau",
+            GRD_NAMES,
+            help="La version actuelle prend en charge uniquement Groupe E et Romande Energie.",
+        )
+        offer = st.selectbox(
+            "Tarif de référence",
+            offers_for_grd(grd),
+            help="Vérifiez toujours le produit effectivement indiqué sur la facture du client.",
+        )
     data = all_data[all_data["year"].isin(selected_years)].copy()
     annual = annual_summary(data)
     monthly = monthly_summary(data)
@@ -703,22 +1117,50 @@ def main() -> None:
     tabs = st.tabs(
         [
             "Synthèse",
+            "Tarifs GRD",
             "Profil & pilotage",
             "Journées types",
             "Conseils Soleol",
             "Données & export",
         ]
     )
+    with tabs[1]:
+        rates_by_year, include_go, export_rate_table = show_tariff_configuration(
+            grd, offer, selected_years
+        )
+    priced = apply_billing_rates(data, grd, rates_by_year, include_go=include_go)
+    fixed_billing = fixed_charges_by_month(priced, rates_by_year)
+    annual_billing = billing_summary(priced, fixed_billing)
+    monthly_billing = monthly_billing_summary(priced, fixed_billing)
+    quarterly_billing = quarterly_export_summary(priced)
     with tabs[0]:
         show_summary_tab(data, all_data, annual, monthly, selected_years)
     with tabs[1]:
-        show_profile_tab(metrics, settings)
+        show_tariff_results(
+            priced,
+            annual_billing,
+            monthly_billing,
+            quarterly_billing,
+            grd,
+            include_go,
+        )
     with tabs[2]:
-        show_typical_days_tab(data, selected_years, settings)
+        show_profile_tab(metrics, settings)
     with tabs[3]:
-        show_recommendations_tab(metrics, quality, settings)
+        show_typical_days_tab(data, selected_years, settings)
     with tabs[4]:
-        show_data_tab(data, annual, monthly, quality, convention)
+        show_recommendations_tab(metrics, quality, settings)
+    with tabs[5]:
+        show_data_tab(
+            data,
+            annual,
+            monthly,
+            quality,
+            convention,
+            annual_billing,
+            monthly_billing,
+            export_rate_table,
+        )
 
 
 if __name__ == "__main__":

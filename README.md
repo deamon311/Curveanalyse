@@ -5,7 +5,7 @@ Elle lit des courbes de charge réseau, visualise les importations et injections
 réelles, puis priorise le déplacement des usages pilotables avant toute étude de
 batterie.
 
-## Ce que fait la V2
+## Ce que fait l’application
 
 - charge plusieurs fichiers Excel sans modifier le code pour ajouter une année ;
 - détecte une ligne d’en-tête `Date`, `Soutirage / Import` et `Surplus / Export` ;
@@ -25,6 +25,55 @@ batterie.
   théorique de déplacement de charge ;
 - génère des recommandations client compréhensibles.
 
+### Tarifs GRD : Groupe E et Romande Energie
+
+L’application propose maintenant un onglet **Tarifs GRD**, limité volontairement
+à ces deux gestionnaires de réseau. Il applique le calendrier du **tarif double**
+au quart d’heure, sur l’horodatage d’analyse :
+
+| GRD | 2025 | 2026 |
+| --- | --- | --- |
+| Groupe E | HT 07:00–21:00, tous les jours | HT 07:00–12:00 et 17:00–23:00, tous les jours |
+| Romande Energie | HT lundi–vendredi 17:00–22:00 ; BT le reste du temps | HT lundi–vendredi 17:00–22:00 ; BT le reste du temps |
+
+La facture estimée est ventilée en quatre postes, chacun paramétrable par année :
+
+- énergie ;
+- distribution ;
+- Swissgrid ;
+- taxes et redevances.
+
+Les montants variables sont en `ct/kWh` HT/BT. Les frais fixes sont saisis en
+`CHF/mois` et proratisés aux jours calendaires disponibles. Les coûts sont
+calculés sur les **kWh** mesurés, jamais sur les puissances instantanées en kW.
+
+La reprise photovoltaïque est configurée séparément par **trimestre civil** :
+
+- rétribution de l’énergie injectée ;
+- garanties d’origine (GO), activables seulement lorsqu’elles sont réellement
+  cédées au GRD.
+
+Une cellule vide signifie « tarif non publié ou non confirmé » et ne vaut jamais
+zéro. L’application ne calcule alors pas de solde complet, afin d’éviter toute
+fausse précision.
+
+Les préréglages Romande Energie correspondent au produit **Double — Energie
+Suisse** de la fiche tarifaire résidentielle/PME, hors TVA et hors taxes locales.
+Les montants Groupe E doivent être ventilés depuis la facture du client : le
+fichier fourni contient des prix globaux HT/BT mais pas leur ventilation entre
+les quatre postes.
+
+Sources à contrôler lors de chaque mise à jour annuelle :
+
+- [horaires et offre de reprise Groupe E](https://www.groupe-e.ch/fr/solaire/offre-reprise) ;
+- [tarifs Groupe E](https://www.groupe-e.ch/fr/electricite/star) ;
+- [tarifs et prix de reprise Romande Energie](https://www.romande-energie.ch/solaire/prix-de-reprise) ;
+- [prix de marché trimestriels OFEN](https://www.bfe.admin.ch/fr/prix-de-marche-de-reference).
+
+Limites explicites du module actuel : il ne choisit pas automatiquement le
+produit contractuel, la commune, les taxes locales, la TVA ou une composante de
+puissance. Ces éléments doivent être saisis ou validés avec la facture client.
+
 L’application ne calcule **ni la consommation totale du bâtiment ni la production
 photovoltaïque totale** avec les seuls flux import/export. Elle ne dimensionne pas
 encore une batterie et ne présente donc aucun gain financier de stockage sans
@@ -38,11 +87,14 @@ analyse-energie/
 ├── energy_analysis/
 │   ├── ingest.py           # lecture Excel, unités, déduplication, qualité
 │   ├── metrics.py          # kWh, périodes, profils et comparaison
+│   ├── grd_profiles.py     # horaires Groupe E / Romande Energie et reprise PV
+│   ├── tariffs.py          # coûts ventilés et reprise trimestrielle
 │   ├── recommendations.py  # règles de conseil explicables
 │   ├── charts.py           # figures Plotly
 │   └── config.py           # couleurs et seuils visibles
 ├── tests/
-│   └── test_energy_analysis.py
+│   ├── test_energy_analysis.py
+│   └── test_tariffs.py
 ├── .streamlit/config.toml
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -114,7 +166,6 @@ Le modèle est séparé de Streamlit pour pouvoir ajouter sans réécrire les ca
 
 - un scénario de pilotage paramétrable (ECS, PAC, véhicule électrique) ;
 - une simulation de batterie au quart d’heure **après** pilotage ;
-- tarifs d’achat et de rétribution paramétrables ;
 - comparaison avant / après batterie ;
 - rapport PDF client avec synthèse, graphiques, recommandations et hypothèses.
 

@@ -227,3 +227,70 @@ def seasonal_energy_chart(metrics: dict[str, Any]) -> go.Figure:
     figure.update_xaxes(**_axes(), title_text="")
     figure.update_yaxes(**_axes(), title_text="Énergie [kWh]")
     return figure
+
+
+def billing_components_chart(summary: pd.DataFrame) -> go.Figure:
+    """Ventile l'estimation annuelle par poste de facture."""
+
+    figure = go.Figure()
+    components = (
+        ("energy_cost_chf", "Énergie", BRAND_ORANGE),
+        ("distribution_cost_chf", "Distribution", "#F4A261"),
+        ("swissgrid_cost_chf", "Swissgrid", "#B892FF"),
+        ("taxes_cost_chf", "Taxes", "#67C5B7"),
+        ("fixed_cost_chf", "Frais fixes", "#7C8793"),
+    )
+    for column, label, color in components:
+        if column in summary:
+            figure.add_bar(
+                x=summary["year"],
+                y=summary[column],
+                name=label,
+                marker_color=color,
+                hovertemplate=f"%{{x}}<br>{label} : %{{y:,.2f}} CHF<extra></extra>",
+            )
+    if "export_revenue_chf" in summary:
+        figure.add_bar(
+            x=summary["year"],
+            y=-summary["export_revenue_chf"],
+            name="Reprise PV",
+            marker_color=EXPORT_COLOR,
+            hovertemplate="%{x}<br>Reprise PV : %{y:,.2f} CHF<extra></extra>",
+        )
+    figure.update_layout(
+        **_layout("Estimation ventilée par composante", height=390, barmode="relative")
+    )
+    figure.update_xaxes(**_axes(), title_text="")
+    figure.update_yaxes(**_axes(), title_text="Montant [CHF]")
+    return figure
+
+
+def monthly_billing_chart(summary: pd.DataFrame) -> go.Figure:
+    """Montre les coûts et la reprise PV par mois sans les confondre."""
+
+    figure = go.Figure()
+    figure.add_bar(
+        x=summary["label"],
+        y=summary["import_variable_cost_chf"],
+        name="Coût variable import",
+        marker_color=IMPORT_COLOR,
+    )
+    if "fixed_cost_chf" in summary:
+        figure.add_bar(
+            x=summary["label"],
+            y=summary["fixed_cost_chf"],
+            name="Frais fixes",
+            marker_color="#7C8793",
+        )
+    figure.add_bar(
+        x=summary["label"],
+        y=-summary["export_revenue_chf"],
+        name="Reprise PV",
+        marker_color=EXPORT_COLOR,
+    )
+    figure.update_layout(
+        **_layout("Coûts et reprise PV par mois", height=410, barmode="relative")
+    )
+    figure.update_xaxes(**_axes(), title_text="", tickangle=-40)
+    figure.update_yaxes(**_axes(), title_text="Montant [CHF]")
+    return figure
